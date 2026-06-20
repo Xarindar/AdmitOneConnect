@@ -1,4 +1,5 @@
 import type { AppConfig, SquareOAuthEnv } from "./config.js";
+import { isRecord } from "./objects.js";
 
 export type Provider = "stripe" | "square";
 
@@ -24,6 +25,8 @@ export interface SquareRefreshData {
   expiresAt: string;
 }
 
+type ProviderHandoffData = StripeHandoffData | SquareHandoffData;
+
 export class ProviderExchangeError extends Error {
   constructor(
     message: string,
@@ -46,16 +49,41 @@ export function buildAuthorizeUrl(
   provider: Provider,
   brokerState: string,
 ): string {
-  if (provider === "stripe") {
-    const url = new URL("https://connect.stripe.com/oauth/authorize");
-    url.searchParams.set("response_type", "code");
-    url.searchParams.set("client_id", config.stripeConnectClientId);
-    url.searchParams.set("scope", "read_write");
-    url.searchParams.set("redirect_uri", providerCallbackUrl(config, provider));
-    url.searchParams.set("state", brokerState);
-    return url.toString();
-  }
+  return authorizeUrlBuilders[provider](config, brokerState);
+}
 
+export async function exchangeProviderCode(
+  config: AppConfig,
+  provider: Provider,
+  code: string,
+): Promise<ProviderHandoffData> {
+  return exchangeCodeHandlers[provider](config, code);
+}
+
+const authorizeUrlBuilders = {
+  stripe: buildStripeAuthorizeUrl,
+  square: buildSquareAuthorizeUrl,
+} satisfies Record<Provider, (config: AppConfig, brokerState: string) => string>;
+
+const exchangeCodeHandlers = {
+  stripe: exchangeStripeCode,
+  square: exchangeSquareCode,
+} satisfies Record<
+  Provider,
+  (config: AppConfig, code: string) => Promise<ProviderHandoffData>
+>;
+
+function buildStripeAuthorizeUrl(config: AppConfig, brokerState: string): string {
+  const url = new URL("https://connect.stripe.com/oauth/authorize");
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", config.stripeConnectClientId);
+  url.searchParams.set("scope", "read_write");
+  url.searchParams.set("redirect_uri", providerCallbackUrl(config, "stripe"));
+  url.searchParams.set("state", brokerState);
+  return url.toString();
+}
+
+function buildSquareAuthorizeUrl(config: AppConfig, brokerState: string): string {
   const url = new URL(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/authorize`);
   url.searchParams.set("client_id", config.squareAppId);
   url.searchParams.set("scope", config.squareOAuthScopes.join(" "));
@@ -103,24 +131,14 @@ export async function exchangeSquareCode(
   config: AppConfig,
   code: string,
 ): Promise<SquareHandoffData> {
-  const response = await fetch(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/token`, {
-    method: "POST",
-    headers: squareJsonHeaders(config),
-    body: JSON.stringify({
-      client_id: config.squareAppId,
-      client_secret: config.squareAppSecret,
+  const body = await squareTokenRequest(
+    config,
+    {
       code,
       grant_type: "authorization_code",
-    }),
-  });
-
-  const body = await parseProviderJson(response);
-  if (!response.ok) {
-    throw new ProviderExchangeError(
-      providerErrorMessage("Square token exchange failed", body),
-      response.status,
-    );
-  }
+    },
+    "Square token exchange failed",
+  );
 
   return {
     accessToken: readString(body, "access_token"),
@@ -135,24 +153,14 @@ export async function refreshSquareToken(
   config: AppConfig,
   refreshToken: string,
 ): Promise<SquareRefreshData> {
-  const response = await fetch(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/token`, {
-    method: "POST",
-    headers: squareJsonHeaders(config),
-    body: JSON.stringify({
-      client_id: config.squareAppId,
-      client_secret: config.squareAppSecret,
+  const body = await squareTokenRequest(
+    config,
+    {
       grant_type: "refresh_token",
       refresh_token: refreshToken,
-    }),
-  });
-
-  const body = await parseProviderJson(response);
-  if (!response.ok) {
-    throw new ProviderExchangeError(
-      providerErrorMessage("Square refresh failed", body),
-      response.status,
-    );
-  }
+    },
+    "Square refresh failed",
+  );
 
   return {
     accessToken: readString(body, "access_token"),
@@ -172,6 +180,29 @@ function squareJsonHeaders(config: AppConfig): Record<string, string> {
     "content-type": "application/json",
     "square-version": config.squareApiVersion,
   };
+}
+
+async function squareTokenRequest(
+  config: AppConfig,
+  fields: Record<string, string>,
+  errorPrefix: string,
+): Promise<unknown> {
+  const response = await fetch(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/token`, {
+    method: "POST",
+    headers: squareJsonHeaders(config),
+    body: JSON.stringify({
+      client_id: config.squareAppId,
+      client_secret: config.squareAppSecret,
+      ...fields,
+    }),
+  });
+
+  const body = await parseProviderJson(response);
+  if (!response.ok) {
+    throw new ProviderExchangeError(providerErrorMessage(errorPrefix, body), response.status);
+  }
+
+  return body;
 }
 
 async function parseProviderJson(response: Response): Promise<unknown> {
@@ -222,6 +253,3 @@ function readBoolean(body: unknown, field: string): boolean {
   throw new ProviderExchangeError(`Provider response missing ${field}`);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
