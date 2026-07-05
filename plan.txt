@@ -1,0 +1,168 @@
+# Pivot payments to one-click OAuth connect via a standalone AdmitOne Connect broker
+
+## Context
+
+Today payments are **bring-your-own-credentials**: each client pastes their own Stripe `sk_live_…`,
+Square access token, PayPal client ID/secret + webhook secrets into a multi-step wizard
+(`modules/payments/components/connect-wizard.tsx`). Too complex for clients.
+
+Target: **client clicks "Connect Stripe" → Stripe-hosted login/signup/onboarding → returns to their
+dashboard. No keys, no webhook setup.** Standard Stripe Connect / Square OAuth.
+
+**Hard constraint:** the client connects via OAuth, but their *ongoing payments must NOT depend on
+AdmitOne.* If AdmitOne is down, charges must still work. → **token-broker** model: AdmitOne hosts a
+small service that does only the OAuth *handshake* and hands a **per-merchant token back to the
+client's own deployment**, which then charges providers **directly** (as it does today). AdmitOne is
+never in the payment path.
+
+Why a broker: every "Connect with X" needs a **platform-level OAuth credential** (Stripe Connect
+`client_id`+secret, Square app id/secret). Those must not live in per-client deployments — the broker
+holds them centrally.
+
+**Decision (this revision):** the broker is a **brand-new standalone project** the user owns and
+deploys themselves:
+
+> **`C:\Users\Abe Tannenbaum\Documents\AdmitOneConnect`** — its own git repo, NOT part of this repo.
+
+So this is **two codebases** that share only a **documented wire protocol** (no shared code):
+- **AdmitOne Connect** (new repo) — holds platform secrets, does the OAuth handshake.
+- **Showrunner** (this repo) — gets the client-side connect buttons/routes; charges directly forever after.
+
+### Research findings (confirmed)
+- Single-tenant-per-Railway-deployment; site resolved by hostname (`lib/site.ts`).
+- **Charges are already per-merchant, no platform secret needed** (Stripe `lib/commerce/stripe.ts:28`,
+  Square `lib/commerce/square.ts:107`, PayPal `lib/commerce/paypal.ts`). Token-broker drops in cleanly.
+- **Credential model already supports OAuth tokens** — `PaymentGatewayCredential` has
+  `encryptedAccessToken`, `encryptedRefreshToken`, `externalAccountId`, `expiresAt`, `metadata`
+  (`prisma/schema/commerce.prisma`). **No migration needed**; mark `metadata.onboarding="oauth"`.
+- Precedent for signed-state OAuth + AES-256-GCM storage: `lib/scheduling/google-calendar.ts`.
+- **No test runner.** Verify with `npm run build` + `npm run lint` + dev-server browser/curl checks.
+
+## Per-provider decision (driven by the no-dependency constraint)
+
+| Provider | Approach | Ongoing AdmitOne dependency |
+|---|---|---|
+| **Stripe** | Connect **Standard** + OAuth → returns long-lived per-merchant token + `acct_…` | **None** |
+| **Square** | OAuth → returns access+refresh token + `merchant_id` | **Token refresh only** (~30-day expiry; off the payment path, 30-day buffer) |
+| **PayPal** | **Keep existing paste-credentials flow**, de-emphasized to "Advanced" | None (but not one-click) |
+
+PayPal's one-click path (Partner Referrals) needs AdmitOne in the payment path → violates the
+constraint → excluded. Stripe **Standard** (not Express) is required so charges don't route through the platform.
+
+## Wire protocol contract (BOTH codebases implement this identically)
+
+HMAC-SHA256 signed tokens; format `base64url(JSON payload) + "." + base64url(HMAC(payload, secret))`.
+
+- **Client → broker (start):** browser redirected to
+  `GET {ADMITONE_CONNECT_BASE_URL}/connect/{provider}/start?client_id={CLIENT_ID}&state={clientState}`
+  where `provider ∈ {stripe, square}`.
+  - `clientState` payload: `{v:1, siteId, provider, returnUrl, nonce, iat, exp(10min)}`, signed with
+    the client's `ADMITONE_CONNECT_SHARED_SECRET`. `returnUrl = {NEXT_PUBLIC_APP_URL}/api/payments/connect/{provider}/callback`.
+  - Client also sets a signed httpOnly cookie `connect_nonce={nonce}` to bind the round-trip (CSRF/replay).
+- **Broker behavior:** look up `client_id` in its registry → get that client's shared secret + allowed
+  return origin. **Reject if `returnUrl` origin ≠ registered origin.** Pack `{clientState, returnUrl}`
+  into a broker-signed JWT, redirect to the provider authorize URL (`redirect_uri` = broker callback,
+  `state` = broker JWT). On provider callback, verify JWT, exchange `code` **using platform secret**.
+- **Broker → client (handoff):** redirect browser to `{returnUrl}?handoff={token}` (or `?error=...`).
+  - `handoff` payload: `{v:1, provider, siteId, nonce, data, iat, exp(5min)}`, signed with **that
+    client's shared secret**.
+  - Stripe `data`: `{accessToken, refreshToken, stripeUserId, livemode, scope}`.
+  - Square `data`: `{accessToken, refreshToken, merchantId, expiresAt, environment}`.
+- **Client callback:** verify handoff HMAC + `exp` + `nonce === connect_nonce cookie`; store tokens
+  **encrypted** in `PaymentGatewayCredential` (`metadata.onboarding="oauth"`); redirect to
+  `/admin/modules/payments?connected={provider}`.
+- **Square refresh:** client `POST {ADMITONE_CONNECT_BASE_URL}/connect/square/refresh` with body
+  `{client_id, refreshToken}` + header `X-AdmitOne-Signature: HMAC(body, sharedSecret)` → broker
+  refreshes with the Square app secret → returns `{accessToken, refreshToken, expiresAt}`. **Broker
+  stays stateless** (client holds the refresh token, encrypted).
+
+### Env vars
+- **AdmitOne Connect (new repo):** `PORT`, `STRIPE_CONNECT_CLIENT_ID`, `STRIPE_PLATFORM_SECRET_KEY`,
+  `SQUARE_APP_ID`, `SQUARE_APP_SECRET`, `SQUARE_OAUTH_ENV`, `ADMITONE_CONNECT_SIGNING_SECRET`,
+  `ADMITONE_CONNECT_CLIENTS` (JSON registry: `id → {secret, returnOrigin}`).
+- **Showrunner (this repo) clients:** `ADMITONE_CONNECT_BASE_URL`, `ADMITONE_CONNECT_CLIENT_ID`,
+  `ADMITONE_CONNECT_SHARED_SECRET`.
+
+### Out-of-band prerequisites (ops — user does, not code)
+- Stripe platform account with **Connect enabled**; OAuth `client_id` (`ca_…`) + broker redirect URI registered.
+- Square **Developer app**; OAuth redirect = broker callback; app id/secret.
+- Register each client deployment in the broker registry (id + shared secret + allowed return origin).
+
+## Work units
+
+**6 units, two codebases.** All are independently mergeable: client units touch only new files or
+single-owner shared files and coordinate via the contract above (no cross-imports), so they can run
+fully in parallel. The broker is a separate repo built by a non-worktree agent.
+
+### AdmitOne Connect — new standalone repo at `Documents\AdmitOneConnect`
+| # | Unit | Build | Contents |
+|---|---|---|---|
+| 1 | **AdmitOne Connect broker (whole service)** | non-worktree agent, absolute paths into `Documents\AdmitOneConnect`; `git init` + local commit (no PR) | Minimal **Express + TypeScript** app: handoff/state HMAC helpers, client registry + return-origin allowlist, `/health`, `/connect/stripe/{start,callback}`, `/connect/square/{start,callback,refresh}`, Stripe (Standard OAuth) + Square code→token exchange + Square refresh, `.env.example`, `README` (deploy + provider-app setup). |
+
+(Stripe + Square share the broker core, so the broker is one cohesive unit in its own fresh repo.)
+
+### Showrunner — this repo (worktree-isolated, parallel, PRs)
+| # | Wave | Unit | Files (single-owner) | Change |
+|---|---|---|---|---|
+| 2 | A | **Client connect lib + OAuth routes** | new `lib/payments/connect/*`, new `app/api/payments/connect/[provider]/{start,callback}/route.ts` | Build signed state + nonce cookie, redirect to broker; verify handoff, store tokens encrypted. New files only. |
+| 3 | A | **Payments UI pivot** | `modules/payments/{page.tsx,module.ts,actions.ts}`, `components/{payments-workspace,connect-wizard,manage-modals}.tsx` | Replace paste-wizard with one-click **Connect Stripe / Connect Square** (links to `/api/payments/connect/{provider}/start`); manage/disconnect; move PayPal under "Advanced (paste keys)". |
+| 4 | A | **Charge/webhook OAuth compat** | `lib/commerce/square.ts`, `lib/commerce/stripe.ts`, `lib/payments/credentials.ts` | Read OAuth tokens for charge/refund/webhook; Square refresh-on-expiry guard (calls broker). |
+| 5 | A | **Square token refresh worker** | new `scripts/refresh-square-tokens.ts` + lib fn, `package.json` (script owner) | Proactively refresh Square tokens via broker before expiry. |
+| 6 | A | **Client config + docs** | `.env.example` (new client vars), `README.md` | Document broker base URL / client id / shared secret + the connect flow. |
+
+Recommended merge order so main never shows a dead button: unit 2 before unit 3. All 6 can be authored
+in parallel; only the merge sequence matters.
+
+## End-to-end verification recipe (per worker)
+
+No test runner. Each worker:
+1. **Build + lint.** Broker: `npm run build` (tsc) + `npm run lint` if configured. Showrunner:
+   `npm run build` (runs `prisma generate` + `next build` = typecheck) + `npm run lint`. Must pass.
+2. **Logic smoke** (broker + units 2/4): a throwaway `npx tsx` snippet that signs a handoff/state with a
+   test secret and asserts it round-trips, and that a forged/expired token is rejected.
+3. **Dev-server check:**
+   - **Broker (unit 1):** `npm run dev` (or `tsx src/server.ts`) with dummy env; `curl -i
+     /connect/stripe/start?client_id=test&state=<signed>` → **302** to `connect.stripe.com/oauth/authorize?…`
+     with correct `client_id`, `scope=read_write`, broker `redirect_uri`. Assert callback **rejects** a
+     forged `state` and a non-allowlisted `returnUrl`. Same shape for Square (`connect.squareup.com/oauth2/authorize`).
+   - **Showrunner UI (unit 3):** `npm run dev`, log in at `/admin/login` (`admin`/`admin`), open
+     `/admin/modules/payments`, screenshot via preview MCP (`mcp__Claude_Preview__*`): one-click
+     **Connect Stripe/Square** render; primary flow no longer asks for pasted keys; PayPal under "Advanced".
+   - **Showrunner routes (unit 2):** `curl -i /api/payments/connect/stripe/start` → **302** whose
+     `Location` is `${ADMITONE_CONNECT_BASE_URL}/connect/stripe/start?...` with a signed `state` + a
+     `connect_nonce` Set-Cookie.
+   - **Units 4/5/6:** build + lint; unit 5 also dry-runs its script against an empty DB (clean no-op).
+   Live OAuth round-trips need real platform apps and are **out of scope** for worker verification —
+   verify redirect construction, signature handling, storage, and UI only.
+
+## Worker instructions (given verbatim to each agent)
+
+```
+After you finish implementing the change:
+1. Code review — Invoke the Skill tool with skill: "code-review" to find correctness bugs (it reports
+   findings; it does not edit code). Fix any findings it surfaces before continuing.
+2. Run unit tests — There is no test runner. Instead run `npm run build` and `npm run lint`; both must
+   pass. Fix anything they surface.
+3. Test end-to-end — Follow the e2e recipe from the coordinator's prompt for your unit. If your unit
+   says skip browser e2e, skip it.
+4. Commit and push — Commit all changes with a clear message. Showrunner units: push the branch and
+   create a PR with `gh pr create` (descriptive title). The broker unit: it is a NEW separate repo at
+   Documents\AdmitOneConnect — run `git init` and commit locally; do NOT push or create a PR (the user
+   will create the remote and deploy). If `gh`/push fails, note it.
+5. Report — End with a single line: `PR: <url>`. Broker or no-PR cases: `PR: none — <reason>`.
+```
+
+## Spawn mechanics
+- **Unit 1 (broker):** `Agent`, `run_in_background: true`, **no worktree** (it writes to the sibling
+  folder `Documents\AdmitOneConnect` via absolute paths and inits its own git repo).
+- **Units 2–6 (Showrunner):** `Agent`, `run_in_background: true`, `isolation: "worktree"`, all in one
+  message → parallel PRs against this repo.
+
+## Risks / notes
+- **Square 30-day expiry** = the one residual (non-payment-path) dependency on the broker; mitigated by
+  proactive refresh (unit 5) + 30-day buffer. Charges keep working until expiry even if broker is down.
+- **Backward compatible:** clients who already pasted keys keep working (charge code reads the same
+  fields). OAuth just becomes the new connect path. No destructive migration.
+- **Broker stack:** minimal Express+TS for portability to "your own server" (Hono/Next route handlers
+  are drop-in alternatives). It is stateless except for the client registry env.
+- **PayPal** stays paste-based by design (one-click would require ongoing AdmitOne dependency).
