@@ -103,7 +103,10 @@ function requirePattern(
 }
 
 function requireSquareSecret(env: NodeJS.ProcessEnv): string {
-  const value = requireSecret(env, "SQUARE_APP_SECRET");
+  // Square issues this credential, so its length is not under our control.
+  // Validate presence and guard against the common app-id/secret swap without
+  // imposing our entropy policy for locally generated secrets.
+  const value = requireEnv(env, "SQUARE_APP_SECRET");
   if (/^(?:sq0idp-|sandbox-sq0idb-)/.test(value)) {
     throw new Error("SQUARE_APP_SECRET must be an application secret, not a Square application id");
   }

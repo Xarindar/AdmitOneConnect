@@ -335,6 +335,13 @@ test("configuration rejects short or swapped credentials", () => {
     () => loadConfig({ ...validEnv, ADMITONE_CONNECT_SIGNING_SECRET: "too-short" }),
     /at least 32 characters/,
   );
+  assert.doesNotThrow(
+    () => loadConfig({ ...validEnv, SQUARE_APP_SECRET: "provider-issued" }),
+  );
+  assert.throws(
+    () => loadConfig({ ...validEnv, SQUARE_APP_SECRET: validEnv.SQUARE_APP_ID }),
+    /SQUARE_APP_SECRET/,
+  );
   assert.throws(
     () => parseRegistry(JSON.stringify({
       client: { secret: "too-short", returnOrigin: "https://client.example.com" },
