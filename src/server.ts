@@ -10,6 +10,8 @@ import {
   isProvider,
   ProviderExchangeError,
   refreshSquareToken,
+  type SquareHandoffData,
+  type SquareRefreshData,
   type Provider,
 } from "./lib/providers.js";
 import {
@@ -18,10 +20,18 @@ import {
   type ClientEntry,
   type ClientRegistry,
 } from "./lib/registry.js";
+import { isRecord } from "./lib/objects.js";
 import { verifyRawBodySignature } from "./lib/signatures.js";
-import { sign, TokenError, verify } from "./lib/tokens.js";
+import { TOKEN_TYPES } from "./lib/token-types.js";
+import { open, seal, sign, TokenError, verify } from "./lib/tokens.js";
+
+const BROKER_STATE_TTL_SECONDS = 10 * 60;
+const HANDOFF_TTL_SECONDS = 5 * 60;
+const SIGNED_REFRESH_WINDOW_SECONDS = 5 * 60;
+const SQUARE_REFRESH_HANDLE_TTL_SECONDS = 365 * 24 * 60 * 60;
 
 interface ClientStatePayload {
+  typ: typeof TOKEN_TYPES.clientState;
   v: 1;
   siteId: string;
   provider: Provider;
@@ -32,6 +42,7 @@ interface ClientStatePayload {
 }
 
 interface BrokerStatePayload {
+  typ: typeof TOKEN_TYPES.brokerState;
   v: 1;
   clientId: string;
   provider: Provider;
@@ -42,6 +53,7 @@ interface BrokerStatePayload {
 }
 
 interface HandoffPayload {
+  typ: typeof TOKEN_TYPES.handoff;
   v: 1;
   provider: Provider;
   siteId: string;
@@ -49,6 +61,24 @@ interface HandoffPayload {
   data: unknown;
   iat: number;
   exp: number;
+}
+
+interface SquareRefreshTokenPayload {
+  typ: typeof TOKEN_TYPES.squareRefresh;
+  v: 1;
+  provider: "square";
+  clientId: string;
+  merchantId: string;
+  refreshToken: string;
+  iat: number;
+  exp: number;
+}
+
+interface SquareRefreshBody {
+  client_id: string;
+  refreshToken: string;
+  timestamp: number;
+  nonce: string;
 }
 
 interface RawBodyRequest extends Request {
@@ -72,6 +102,7 @@ type AsyncHandler = (
 
 export function createApp(config: AppConfig, registry: ClientRegistry): express.Express {
   const app = express();
+  const usedRefreshNonces = new Map<string, number>();
 
   app.disable("x-powered-by");
   app.use(
@@ -96,20 +127,25 @@ export function createApp(config: AppConfig, registry: ClientRegistry): express.
       const client = requireClient(registry, clientId);
 
       const clientState = validateClientState(
-        verify<ClientStatePayload>(clientStateToken, client.secret),
+        verify<ClientStatePayload>(
+          clientStateToken,
+          client.secret,
+          TOKEN_TYPES.clientState,
+        ),
         provider,
       );
       assertAllowedReturnUrl(clientState.returnUrl, client.returnOrigin);
 
       const now = nowSeconds();
       const brokerState: BrokerStatePayload = {
+        typ: TOKEN_TYPES.brokerState,
         v: 1,
         clientId,
         provider,
         clientState,
         returnUrl: clientState.returnUrl,
         iat: now,
-        exp: now + 10 * 60,
+        exp: now + BROKER_STATE_TTL_SECONDS,
       };
 
       const redirectUrl = buildAuthorizeUrl(
@@ -130,6 +166,7 @@ export function createApp(config: AppConfig, registry: ClientRegistry): express.
         verify<BrokerStatePayload>(
           requiredQuery(req, "state"),
           config.brokerSigningSecret,
+          TOKEN_TYPES.brokerState,
         ),
         provider,
       );
@@ -143,42 +180,51 @@ export function createApp(config: AppConfig, registry: ClientRegistry): express.
           state.returnUrl,
           provider,
           providerError,
-          optionalQuery(req, "error_description"),
+          "Provider authorization was not completed.",
         );
         return;
       }
 
       const code = requiredQuery(req, "code");
+      const now = nowSeconds();
       let data: unknown;
       try {
-        data =
-          provider === "stripe"
-            ? await exchangeStripeCode(config, code)
-            : await exchangeSquareCode(config, code);
+        data = await exchangeAndPrepareHandoffData(
+          config,
+          provider,
+          code,
+          client,
+          state.clientId,
+          now,
+        );
       } catch (error) {
+        console.error("Provider token exchange failed", error);
         redirectToClientError(
           res,
           state.returnUrl,
           provider,
           "token_exchange_failed",
-          error instanceof Error ? error.message : undefined,
+          "Unable to complete provider token exchange.",
         );
         return;
       }
 
-      const now = nowSeconds();
       const handoff: HandoffPayload = {
+        typ: TOKEN_TYPES.handoff,
         v: 1,
         provider,
         siteId: state.clientState.siteId,
         nonce: state.clientState.nonce,
         data,
         iat: now,
-        exp: now + 5 * 60,
+        exp: now + HANDOFF_TTL_SECONDS,
       };
 
       const redirectUrl = new URL(state.returnUrl);
-      redirectUrl.searchParams.set("handoff", sign(handoff, client.secret));
+      redirectUrl.searchParams.set(
+        "handoff",
+        seal(handoff, client.secret, TOKEN_TYPES.handoff),
+      );
       res.redirect(302, redirectUrl.toString());
     }),
   );
@@ -195,8 +241,27 @@ export function createApp(config: AppConfig, registry: ClientRegistry): express.
         throw new HttpError(401, "invalid request signature");
       }
 
-      const refreshed = await refreshSquareToken(config, body.refreshToken);
-      res.json(refreshed);
+      assertFreshRefreshRequest(body, usedRefreshNonces);
+
+      const refreshHandle = validateSquareRefreshToken(
+        open<SquareRefreshTokenPayload>(
+          body.refreshToken,
+          client.secret,
+          TOKEN_TYPES.squareRefresh,
+        ),
+        body.client_id,
+      );
+
+      const refreshed = await refreshSquareToken(config, refreshHandle.refreshToken);
+      res.json(
+        sealSquareRefreshResponse(
+          refreshed,
+          client,
+          body.client_id,
+          refreshHandle.merchantId,
+          nowSeconds(),
+        ),
+      );
     }),
   );
 
@@ -276,6 +341,87 @@ function requireClient(registry: ClientRegistry, clientId: string): ClientEntry 
   return client;
 }
 
+async function exchangeAndPrepareHandoffData(
+  config: AppConfig,
+  provider: Provider,
+  code: string,
+  client: ClientEntry,
+  clientId: string,
+  now: number,
+): Promise<unknown> {
+  switch (provider) {
+    case "stripe":
+      return exchangeStripeCode(config, code);
+    case "square":
+      return sealSquareHandoffData(
+        await exchangeSquareCode(config, code),
+        client,
+        clientId,
+        now,
+      );
+    default:
+      return assertNever(provider);
+  }
+}
+
+function sealSquareHandoffData(
+  data: SquareHandoffData,
+  client: ClientEntry,
+  clientId: string,
+  now: number,
+): SquareHandoffData {
+  return {
+    ...data,
+    refreshToken: sealSquareRefreshToken(
+      data.refreshToken,
+      client,
+      clientId,
+      data.merchantId,
+      now,
+    ),
+  };
+}
+
+function sealSquareRefreshResponse(
+  data: SquareRefreshData,
+  client: ClientEntry,
+  clientId: string,
+  merchantId: string,
+  now: number,
+): SquareRefreshData {
+  return {
+    ...data,
+    refreshToken: sealSquareRefreshToken(
+      data.refreshToken,
+      client,
+      clientId,
+      merchantId,
+      now,
+    ),
+  };
+}
+
+function sealSquareRefreshToken(
+  refreshToken: string,
+  client: ClientEntry,
+  clientId: string,
+  merchantId: string,
+  now: number,
+): string {
+  const payload: SquareRefreshTokenPayload = {
+    typ: TOKEN_TYPES.squareRefresh,
+    v: 1,
+    provider: "square",
+    clientId,
+    merchantId,
+    refreshToken,
+    iat: now,
+    exp: now + SQUARE_REFRESH_HANDLE_TTL_SECONDS,
+  };
+
+  return seal(payload, client.secret, TOKEN_TYPES.squareRefresh);
+}
+
 function validateClientState(
   payload: ClientStatePayload,
   expectedProvider: Provider,
@@ -285,6 +431,9 @@ function validateClientState(
   }
   if (payload.v !== 1) {
     throw new HttpError(400, "unsupported client state version");
+  }
+  if (payload.typ !== TOKEN_TYPES.clientState) {
+    throw new HttpError(400, "client state type mismatch");
   }
   if (payload.provider !== expectedProvider) {
     throw new HttpError(400, "client state provider mismatch");
@@ -307,7 +456,11 @@ function validateBrokerState(
   if (!isRecord(payload)) {
     throw new HttpError(400, "broker state must be an object");
   }
-  if (payload.v !== 1 || payload.provider !== expectedProvider) {
+  if (
+    payload.typ !== TOKEN_TYPES.brokerState ||
+    payload.v !== 1 ||
+    payload.provider !== expectedProvider
+  ) {
     throw new HttpError(400, "broker state provider mismatch");
   }
   if (
@@ -334,20 +487,85 @@ function assertAllowedReturnUrl(returnUrl: string, registeredOrigin: string): vo
   }
 }
 
-function validateSquareRefreshBody(body: unknown): {
-  client_id: string;
-  refreshToken: string;
-} {
+function validateSquareRefreshBody(body: unknown): SquareRefreshBody {
   if (!isRecord(body)) {
     throw new HttpError(400, "request body must be JSON");
   }
-  if (typeof body.client_id !== "string" || body.client_id.trim() === "") {
+  const clientId = body.client_id;
+  const refreshToken = body.refreshToken;
+  const timestamp = body.timestamp;
+  const nonce = body.nonce;
+
+  if (typeof clientId !== "string" || clientId.trim() === "") {
     throw new HttpError(400, "missing client_id");
   }
-  if (typeof body.refreshToken !== "string" || body.refreshToken.trim() === "") {
+  if (typeof refreshToken !== "string" || refreshToken.trim() === "") {
     throw new HttpError(400, "missing refreshToken");
   }
-  return { client_id: body.client_id, refreshToken: body.refreshToken };
+  if (typeof timestamp !== "number" || !Number.isInteger(timestamp)) {
+    throw new HttpError(400, "missing timestamp");
+  }
+  if (typeof nonce !== "string" || nonce.trim() === "") {
+    throw new HttpError(400, "missing nonce");
+  }
+  if (nonce.length > 128) {
+    throw new HttpError(400, "nonce is too long");
+  }
+  return {
+    client_id: clientId,
+    refreshToken,
+    timestamp,
+    nonce,
+  };
+}
+
+function assertFreshRefreshRequest(
+  body: SquareRefreshBody,
+  usedRefreshNonces: Map<string, number>,
+): void {
+  const now = nowSeconds();
+  pruneExpiredNonces(usedRefreshNonces, now);
+
+  if (Math.abs(now - body.timestamp) > SIGNED_REFRESH_WINDOW_SECONDS) {
+    throw new HttpError(401, "stale request signature");
+  }
+
+  const nonceKey = `${body.client_id}:${body.nonce}`;
+  if (usedRefreshNonces.has(nonceKey)) {
+    throw new HttpError(401, "replayed request signature");
+  }
+  usedRefreshNonces.set(nonceKey, now + SIGNED_REFRESH_WINDOW_SECONDS);
+}
+
+function pruneExpiredNonces(usedRefreshNonces: Map<string, number>, now: number): void {
+  for (const [nonceKey, expiresAt] of usedRefreshNonces) {
+    if (expiresAt <= now) {
+      usedRefreshNonces.delete(nonceKey);
+    }
+  }
+}
+
+function validateSquareRefreshToken(
+  payload: SquareRefreshTokenPayload,
+  clientId: string,
+): SquareRefreshTokenPayload {
+  if (
+    !isRecord(payload) ||
+    payload.typ !== TOKEN_TYPES.squareRefresh ||
+    payload.v !== 1 ||
+    payload.provider !== "square" ||
+    payload.clientId !== clientId ||
+    typeof payload.merchantId !== "string" ||
+    payload.merchantId.trim() === "" ||
+    typeof payload.refreshToken !== "string" ||
+    payload.refreshToken.trim() === "" ||
+    !Number.isInteger(payload.iat) ||
+    !Number.isInteger(payload.exp)
+  ) {
+    throw new HttpError(401, "invalid refresh token");
+  }
+
+  return payload;
 }
 
 function redirectToClientError(
@@ -382,8 +600,8 @@ function readErrorStatus(error: unknown): number | undefined {
   return error.status >= 400 && error.status < 600 ? error.status : undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function assertNever(value: never): never {
+  throw new Error(`unsupported provider: ${String(value)}`);
 }
 
 function main(): void {

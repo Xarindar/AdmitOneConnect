@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
+import { timingSafeEqualText } from "./security.js";
 import { base64urlEncode } from "./tokens.js";
+
+const BASE64URL_SHA256_LENGTH = 43;
+const BASE64URL_SHA256_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export function signRawBody(rawBody: string, secret: string): string {
   return base64urlEncode(
@@ -15,24 +19,22 @@ export function verifyRawBodySignature(
   if (!headerValue) return false;
 
   const expected = signRawBody(rawBody, secret);
-  const candidates = normalizeSignatureHeader(headerValue);
+  const candidate = normalizeSignatureHeader(headerValue);
 
-  return candidates.some((candidate) => timingSafeEqualText(candidate, expected));
+  return candidate !== undefined && timingSafeEqualText(candidate, expected);
 }
 
-function normalizeSignatureHeader(headerValue: string): string[] {
-  return headerValue
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const equalsIndex = part.indexOf("=");
-      return equalsIndex >= 0 ? part.slice(equalsIndex + 1).trim() : part;
-    });
-}
+function normalizeSignatureHeader(headerValue: string): string | undefined {
+  const value = headerValue.trim();
+  if (value.includes(",")) return undefined;
 
-function timingSafeEqualText(a: string, b: string): boolean {
-  const aBuffer = Buffer.from(a, "utf8");
-  const bBuffer = Buffer.from(b, "utf8");
-  return aBuffer.length === bBuffer.length && crypto.timingSafeEqual(aBuffer, bBuffer);
+  const candidate = value.startsWith("v1=") ? value.slice("v1=".length).trim() : value;
+  if (
+    candidate.length !== BASE64URL_SHA256_LENGTH ||
+    !BASE64URL_SHA256_PATTERN.test(candidate)
+  ) {
+    return undefined;
+  }
+
+  return candidate;
 }

@@ -1,4 +1,4 @@
-import { URL } from "node:url";
+import { normalizeHttpsBaseUrl } from "./urls.js";
 
 export type SquareOAuthEnv = "production" | "sandbox";
 
@@ -28,7 +28,9 @@ const DEFAULT_SQUARE_SCOPES = [
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     port: parsePort(env.PORT),
-    brokerPublicUrl: normalizeBaseUrl(requireEnv(env, "BROKER_PUBLIC_URL")),
+    brokerPublicUrl: normalizeHttpsBaseUrl(requireEnv(env, "BROKER_PUBLIC_URL"), "BROKER_PUBLIC_URL", {
+      allowLocalhostHttp: true,
+    }),
     brokerSigningSecret: requireEnv(env, "ADMITONE_CONNECT_SIGNING_SECRET"),
     stripeConnectClientId: requireEnv(env, "STRIPE_CONNECT_CLIENT_ID"),
     stripePlatformSecretKey: requireEnv(env, "STRIPE_PLATFORM_SECRET_KEY"),
@@ -61,23 +63,6 @@ function parseSquareOAuthEnv(raw: string | undefined): SquareOAuthEnv {
   const value = raw?.trim() || "production";
   if (value === "production" || value === "sandbox") return value;
   throw new Error("SQUARE_OAUTH_ENV must be either production or sandbox");
-}
-
-function normalizeBaseUrl(raw: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    throw new Error("BROKER_PUBLIC_URL must be a valid absolute URL");
-  }
-
-  if (parsed.protocol !== "https:" && parsed.hostname !== "localhost") {
-    throw new Error("BROKER_PUBLIC_URL must be HTTPS outside localhost");
-  }
-
-  parsed.hash = "";
-  parsed.search = "";
-  return parsed.toString().replace(/\/$/, "");
 }
 
 function parseScopes(raw: string | undefined): string[] {
