@@ -318,12 +318,12 @@ test("configuration rejects short or swapped credentials", () => {
   const validEnv: NodeJS.ProcessEnv = {
     DATABASE_URL: "postgres://unused",
     BROKER_PUBLIC_URL: "https://connect.example.com",
-    ADMITONE_CONNECT_SIGNING_SECRET: "broker-secret-with-at-least-32-characters",
+    ADMITONE_CONNECT_SIGNING_SECRET: testSecret("broker"),
     STRIPE_CONNECT_CLIENT_ID: "ca_123456",
     STRIPE_PLATFORM_SECRET_KEY: "sk_test_123456",
     SQUARE_OAUTH_ENV: "sandbox",
     SQUARE_APP_ID: "sandbox-sq0idb-example",
-    SQUARE_APP_SECRET: "square-secret-with-at-least-32-characters",
+    SQUARE_APP_SECRET: testSecret("square"),
   };
 
   assert.doesNotThrow(() => loadConfig(validEnv));
@@ -368,4 +368,8 @@ function assertString(value: string | null): string {
 
 function cookieHeader(response: Response): string {
   return assertString(response.headers.get("set-cookie")).split(";", 1)[0];
+}
+
+function testSecret(label: string): string {
+  return `${label}-${"test-fixture-entropy-".repeat(2)}`;
 }
