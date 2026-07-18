@@ -12,6 +12,7 @@ WORKDIR /app
 COPY --chown=node:node --from=build /app/package.json ./package.json
 COPY --chown=node:node --from=build /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/dist ./dist
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 USER node
 EXPOSE 8080
-CMD ["npm", "run", "start"]
+CMD ["node", "dist/server.js"]
