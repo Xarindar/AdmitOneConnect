@@ -3,7 +3,8 @@ import { createServer } from "node:http";
 import { after, before, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { MemoryArtifactStore } from "../src/lib/artifact-store.js";
-import type { AppConfig } from "../src/lib/config.js";
+import { loadConfig, type AppConfig } from "../src/lib/config.js";
+import { parseRegistry } from "../src/lib/registry.js";
 import { signServiceRequest } from "../src/lib/request-auth.js";
 import { TOKEN_TYPES } from "../src/lib/token-types.js";
 import { sign } from "../src/lib/tokens.js";
@@ -11,10 +12,13 @@ import { createApp } from "../src/server.js";
 
 const clientId = "test-client";
 const clientSecret = "test-client-secret-with-sufficient-entropy";
+const attackerClientId = "other-tenant";
+const attackerClientSecret = "other-tenant-secret-with-sufficient-entropy";
 const brokerSecret = "test-broker-secret-with-sufficient-entropy";
 const originalFetch = globalThis.fetch;
 let providerExchangeCount = 0;
 let squareRefreshCount = 0;
+let stripeRevokeCount = 0;
 
 const config: AppConfig = {
   port: 0,
@@ -34,6 +38,10 @@ const config: AppConfig = {
 const store = new MemoryArtifactStore();
 const app = createApp(config, {
   [clientId]: { secret: clientSecret, returnOrigin: "https://client.example.com" },
+  [attackerClientId]: {
+    secret: attackerClientSecret,
+    returnOrigin: "https://other-client.example.com",
+  },
 }, store);
 const server = createServer(app);
 let baseUrl = "";
@@ -54,6 +62,13 @@ before(async () => {
         livemode: false,
         scope: "read_write",
       }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.hostname === "connect.stripe.com" && url.pathname === "/oauth/deauthorize") {
+      stripeRevokeCount += 1;
+      return new Response(JSON.stringify({ stripe_user_id: "acct_test" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
     if (url.hostname === "connect.squareupsandbox.com" && url.pathname === "/oauth2/token") {
       const rawBody = typeof init?.body === "string" ? init.body : "{}";
@@ -90,7 +105,7 @@ test("Square refresh signatures are site/path/time bound and exact replay stops 
   const authorizeUrl = new URL(assertString(start.headers.get("location")));
   const callback = await originalFetch(
     `${baseUrl}/connect/square/callback?code=square-code&state=${encodeURIComponent(assertString(authorizeUrl.searchParams.get("state")))}`,
-    { redirect: "manual" },
+    { redirect: "manual", headers: { cookie: cookieHeader(start) } },
   );
   const opaqueCode = assertString(new URL(assertString(callback.headers.get("location"))).searchParams.get("code"));
 
@@ -175,9 +190,18 @@ test("OAuth state and opaque handoff codes are one-time and credentials stay off
   assert.equal(start.headers.get("referrer-policy"), "no-referrer");
   const authorizeUrl = new URL(assertString(start.headers.get("location")));
   const brokerState = assertString(authorizeUrl.searchParams.get("state"));
+  const brokerCookie = cookieHeader(start);
 
   const callbackUrl = `${baseUrl}/connect/stripe/callback?code=provider-code&state=${encodeURIComponent(brokerState)}`;
-  const callback = await originalFetch(callbackUrl, { redirect: "manual" });
+  const exchangeCountBeforeInjection = providerExchangeCount;
+  const injectedCallback = await originalFetch(callbackUrl, { redirect: "manual" });
+  assert.equal(injectedCallback.status, 401);
+  assert.equal(providerExchangeCount, exchangeCountBeforeInjection);
+
+  const callback = await originalFetch(callbackUrl, {
+    redirect: "manual",
+    headers: { cookie: brokerCookie },
+  });
   assert.equal(callback.status, 302);
   const browserRedirect = assertString(callback.headers.get("location"));
   const parsedRedirect = new URL(browserRedirect);
@@ -187,7 +211,10 @@ test("OAuth state and opaque handoff codes are one-time and credentials stay off
   assert.equal(browserRedirect.includes("access_token"), false);
   assert.equal(browserRedirect.includes("refresh_token"), false);
 
-  const replayedCallback = await originalFetch(callbackUrl, { redirect: "manual" });
+  const replayedCallback = await originalFetch(callbackUrl, {
+    redirect: "manual",
+    headers: { cookie: brokerCookie },
+  });
   assert.equal(replayedCallback.status, 409);
   assert.equal(providerExchangeCount, 1);
 
@@ -238,16 +265,93 @@ test("OAuth state and opaque handoff codes are one-time and credentials stay off
     body: secondRawBody,
   });
   assert.equal(consumedReplay.status, 409);
+
+  const attackerRevokeBody = serviceEnvelope(
+    "attacker-site",
+    "stripe",
+    { externalAccountId: "acct_test" },
+    attackerClientId,
+  );
+  const attackerRevokeRaw = JSON.stringify(attackerRevokeBody);
+  const attackerRevoke = await originalFetch(`${baseUrl}/connect/stripe/revoke`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-admitone-signature": signServiceRequest(
+        "POST",
+        "/connect/stripe/revoke",
+        attackerRevokeRaw,
+        attackerRevokeBody,
+        attackerClientSecret,
+      ),
+    },
+    body: attackerRevokeRaw,
+  });
+  assert.equal(attackerRevoke.status, 403);
+  assert.equal(stripeRevokeCount, 0);
+
+  const ownerRevokeBody = serviceEnvelope("site-1", "stripe", { externalAccountId: "acct_test" });
+  const ownerRevokeRaw = JSON.stringify(ownerRevokeBody);
+  const ownerRevoke = await originalFetch(`${baseUrl}/connect/stripe/revoke`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-admitone-signature": signServiceRequest(
+        "POST",
+        "/connect/stripe/revoke",
+        ownerRevokeRaw,
+        ownerRevokeBody,
+        clientSecret,
+      ),
+    },
+    body: ownerRevokeRaw,
+  });
+  assert.equal(ownerRevoke.status, 204);
+  assert.equal(stripeRevokeCount, 1);
 });
 
 function serviceBody(extra: { code: string; nonce: string; provider: "stripe" }) {
   return serviceEnvelope("site-1", extra.provider, { code: extra.code, nonce: extra.nonce });
 }
 
-function serviceEnvelope<T extends Record<string, unknown>>(siteId: string, provider: "stripe" | "square", fields: T) {
+test("configuration rejects short or swapped credentials", () => {
+  const validEnv: NodeJS.ProcessEnv = {
+    DATABASE_URL: "postgres://unused",
+    BROKER_PUBLIC_URL: "https://connect.example.com",
+    ADMITONE_CONNECT_SIGNING_SECRET: "broker-secret-with-at-least-32-characters",
+    STRIPE_CONNECT_CLIENT_ID: "ca_123456",
+    STRIPE_PLATFORM_SECRET_KEY: "sk_test_123456",
+    SQUARE_OAUTH_ENV: "sandbox",
+    SQUARE_APP_ID: "sandbox-sq0idb-example",
+    SQUARE_APP_SECRET: "square-secret-with-at-least-32-characters",
+  };
+
+  assert.doesNotThrow(() => loadConfig(validEnv));
+  assert.throws(
+    () => loadConfig({ ...validEnv, STRIPE_CONNECT_CLIENT_ID: validEnv.STRIPE_PLATFORM_SECRET_KEY }),
+    /STRIPE_CONNECT_CLIENT_ID/,
+  );
+  assert.throws(
+    () => loadConfig({ ...validEnv, ADMITONE_CONNECT_SIGNING_SECRET: "too-short" }),
+    /at least 32 characters/,
+  );
+  assert.throws(
+    () => parseRegistry(JSON.stringify({
+      client: { secret: "too-short", returnOrigin: "https://client.example.com" },
+    })),
+    /at least 32 characters/,
+  );
+});
+
+function serviceEnvelope<T extends Record<string, unknown>>(
+  siteId: string,
+  provider: "stripe" | "square",
+  fields: T,
+  envelopeClientId = clientId,
+) {
   const now = Math.floor(Date.now() / 1000);
   return {
-    client_id: clientId,
+    client_id: envelopeClientId,
     site_id: siteId,
     provider,
     iat: now,
@@ -260,4 +364,8 @@ function serviceEnvelope<T extends Record<string, unknown>>(siteId: string, prov
 function assertString(value: string | null): string {
   assert.ok(value);
   return value;
+}
+
+function cookieHeader(response: Response): string {
+  return assertString(response.headers.get("set-cookie")).split(";", 1)[0];
 }

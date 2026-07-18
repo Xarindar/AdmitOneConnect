@@ -26,18 +26,38 @@ const DEFAULT_SQUARE_SCOPES = [
 ];
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const squareOAuthEnv = parseSquareOAuthEnv(env.SQUARE_OAUTH_ENV);
   return {
     port: parsePort(env.PORT),
     databaseUrl: requireEnv(env, "DATABASE_URL"),
     brokerPublicUrl: normalizeHttpsBaseUrl(requireEnv(env, "BROKER_PUBLIC_URL"), "BROKER_PUBLIC_URL", {
       allowLocalhostHttp: true,
     }),
-    brokerSigningSecret: requireEnv(env, "ADMITONE_CONNECT_SIGNING_SECRET"),
-    stripeConnectClientId: requireEnv(env, "STRIPE_CONNECT_CLIENT_ID"),
-    stripePlatformSecretKey: requireEnv(env, "STRIPE_PLATFORM_SECRET_KEY"),
-    squareAppId: requireEnv(env, "SQUARE_APP_ID"),
-    squareAppSecret: requireEnv(env, "SQUARE_APP_SECRET"),
-    squareOAuthEnv: parseSquareOAuthEnv(env.SQUARE_OAUTH_ENV),
+    brokerSigningSecret: requireSecret(env, "ADMITONE_CONNECT_SIGNING_SECRET"),
+    stripeConnectClientId: requirePattern(
+      env,
+      "STRIPE_CONNECT_CLIENT_ID",
+      /^ca_[A-Za-z0-9]+$/,
+      "a Stripe Connect client id beginning with ca_",
+    ),
+    stripePlatformSecretKey: requirePattern(
+      env,
+      "STRIPE_PLATFORM_SECRET_KEY",
+      /^sk_(?:live|test)_[A-Za-z0-9]+$/,
+      "a Stripe secret key beginning with sk_live_ or sk_test_",
+    ),
+    squareAppId: requirePattern(
+      env,
+      "SQUARE_APP_ID",
+      squareOAuthEnv === "production"
+        ? /^sq0idp-[A-Za-z0-9_-]+$/
+        : /^sandbox-sq0idb-[A-Za-z0-9_-]+$/,
+      squareOAuthEnv === "production"
+        ? "a production Square application id beginning with sq0idp-"
+        : "a sandbox Square application id beginning with sandbox-sq0idb-",
+    ),
+    squareAppSecret: requireSquareSecret(env),
+    squareOAuthEnv,
     squareApiVersion: env.SQUARE_API_VERSION?.trim() || "2025-12-17",
     squareOAuthScopes: parseScopes(env.SQUARE_OAUTH_SCOPES),
     providerTimeoutMs: parsePositiveInteger(env.PROVIDER_TIMEOUT_MS, 10_000, "PROVIDER_TIMEOUT_MS"),
@@ -57,6 +77,35 @@ function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
   if (!value) {
     throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+function requireSecret(env: NodeJS.ProcessEnv, name: string): string {
+  const value = requireEnv(env, name);
+  if (value.length < 32) {
+    throw new Error(`${name} must be at least 32 characters`);
+  }
+  return value;
+}
+
+function requirePattern(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  pattern: RegExp,
+  description: string,
+): string {
+  const value = requireEnv(env, name);
+  if (!pattern.test(value)) {
+    throw new Error(`${name} must be ${description}`);
+  }
+  return value;
+}
+
+function requireSquareSecret(env: NodeJS.ProcessEnv): string {
+  const value = requireSecret(env, "SQUARE_APP_SECRET");
+  if (/^(?:sq0idp-|sandbox-sq0idb-)/.test(value)) {
+    throw new Error("SQUARE_APP_SECRET must be an application secret, not a Square application id");
   }
   return value;
 }

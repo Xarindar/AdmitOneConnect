@@ -30,6 +30,11 @@ export function parseRegistry(raw: string | undefined): ClientRegistry {
 
   const registry: ClientRegistry = {};
   for (const [clientId, entry] of Object.entries(parsed)) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(clientId)) {
+      throw new Error(
+        `ADMITONE_CONNECT_CLIENTS client id "${clientId}" must contain only letters, numbers, "_" or "-"`,
+      );
+    }
     if (
       !isRecord(entry) ||
       typeof entry.secret !== "string" ||
@@ -40,8 +45,10 @@ export function parseRegistry(raw: string | undefined): ClientRegistry {
       );
     }
     const { secret, returnOrigin } = entry;
-    if (secret.trim() === "") {
-      throw new Error(`ADMITONE_CONNECT_CLIENTS entry "${clientId}" has an empty secret`);
+    if (secret.trim().length < 32) {
+      throw new Error(
+        `ADMITONE_CONNECT_CLIENTS entry "${clientId}" secret must be at least 32 characters`,
+      );
     }
     registry[clientId] = {
       secret,

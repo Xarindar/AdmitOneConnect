@@ -133,7 +133,7 @@ export function createApp(
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
   app.use(securityHeaders);
-  app.use(rateLimit({ keyPrefix: "global", limit: 300, windowMs: 60_000 }));
+  app.use(rateLimit(store, { keyPrefix: "global", limit: 300, windowMs: 60_000 }));
   app.use(
     express.json({
       limit: "32kb",
@@ -146,7 +146,7 @@ export function createApp(
 
   app.get(
     "/health",
-    rateLimit({ keyPrefix: "health", limit: 60, windowMs: 60_000 }),
+    rateLimit(store, { keyPrefix: "health", limit: 60, windowMs: 60_000 }),
     asyncRoute(async (_req, res) => {
       await store.ping();
       res.json({ ok: true });
@@ -155,7 +155,7 @@ export function createApp(
 
   app.get(
     "/connect/:provider/start",
-    rateLimit({ keyPrefix: "oauth-start", limit: 20, windowMs: 10 * 60_000 }),
+    rateLimit(store, { keyPrefix: "oauth-start", limit: 20, windowMs: 10 * 60_000 }),
     asyncRoute(async (req, res) => {
       const provider = parseProvider(req.params.provider);
       const clientId = requiredQuery(req, "client_id");
@@ -188,6 +188,7 @@ export function createApp(
       if (!(await store.registerState(stateId, brokerState.exp))) {
         throw new HttpError(503, "could not initialize OAuth state");
       }
+      setBrokerStateCookie(res, config, provider, stateId);
 
       const redirectUrl = buildAuthorizeUrl(
         config,
@@ -200,7 +201,7 @@ export function createApp(
 
   app.get(
     "/connect/:provider/callback",
-    rateLimit({ keyPrefix: "oauth-callback", limit: 30, windowMs: 10 * 60_000 }),
+    rateLimit(store, { keyPrefix: "oauth-callback", limit: 30, windowMs: 10 * 60_000 }),
     asyncRoute(async (req, res) => {
       const provider = parseProvider(req.params.provider);
       const state = validateBrokerState(
@@ -213,6 +214,10 @@ export function createApp(
       );
       const client = requireClient(registry, state.clientId);
       assertAllowedReturnUrl(state.returnUrl, client.returnOrigin);
+      if (!hasValidBrokerStateCookie(req, config, provider, state.stateId)) {
+        throw new HttpError(401, "OAuth callback did not originate from this browser");
+      }
+      clearBrokerStateCookie(res, config, provider);
       if (!(await store.consumeState(state.stateId))) {
         throw new HttpError(409, "OAuth callback has already been used");
       }
@@ -268,6 +273,13 @@ export function createApp(
         exp: now + HANDOFF_TTL_SECONDS,
       };
       const opaqueCode = randomOpaqueValue();
+      const externalAccountId = providerExternalAccountId(provider, data);
+      await store.registerProviderOwnership(
+        state.clientId,
+        handoff.siteId,
+        provider,
+        externalAccountId,
+      );
       try {
         await store.putHandoff(opaqueCode, {
           clientId: state.clientId,
@@ -282,6 +294,12 @@ export function createApp(
           expiresAt: handoff.exp,
         });
       } catch (error) {
+        await store.removeProviderOwnership(
+          state.clientId,
+          handoff.siteId,
+          provider,
+          externalAccountId,
+        );
         await compensateAuthorization(config, providerCalls, provider, data);
         throw error;
       }
@@ -294,7 +312,7 @@ export function createApp(
 
   app.post(
     "/connect/handoff/redeem",
-    rateLimit({ keyPrefix: "handoff-redeem", limit: 60, windowMs: 5 * 60_000 }),
+    rateLimit(store, { keyPrefix: "handoff-redeem", limit: 60, windowMs: 5 * 60_000 }),
     asyncRoute(async (req, res) => {
       const body = validateHandoffRedeemBody(req.body);
       await authenticateServiceRequest(req, body, registry, store);
@@ -320,7 +338,7 @@ export function createApp(
 
   app.post(
     "/connect/square/refresh",
-    rateLimit({ keyPrefix: "square-refresh", limit: 60, windowMs: 5 * 60_000 }),
+    rateLimit(store, { keyPrefix: "square-refresh", limit: 60, windowMs: 5 * 60_000 }),
     asyncRoute(async (req, res) => {
       const body = validateSquareRefreshBody(req.body);
       const client = await authenticateServiceRequest(req, body, registry, store);
@@ -352,15 +370,40 @@ export function createApp(
 
   app.post(
     "/connect/:provider/revoke",
-    rateLimit({ keyPrefix: "provider-revoke", limit: 30, windowMs: 10 * 60_000 }),
+    rateLimit(store, { keyPrefix: "provider-revoke", limit: 30, windowMs: 10 * 60_000 }),
     asyncRoute(async (req, res) => {
       const provider = parseProvider(req.params.provider);
       const body = validateRevokeBody(req.body, provider);
       await authenticateServiceRequest(req, body, registry, store);
+      const owned = await store.isProviderOwnedBy(
+        body.client_id,
+        body.site_id,
+        provider,
+        body.externalAccountId,
+      );
+      if (!owned) {
+        if (Object.keys(registry).length !== 1) {
+          throw new HttpError(403, "provider account is not owned by this client");
+        }
+        // Backward compatibility for the pre-ownership-map deployment. This is
+        // safe only while the broker has exactly one registered client.
+        await store.registerProviderOwnership(
+          body.client_id,
+          body.site_id,
+          provider,
+          body.externalAccountId,
+        );
+      }
       await providerCalls.run(provider, () =>
         revokeProviderAccess(config, provider, {
           externalAccountId: body.externalAccountId,
         }),
+      );
+      await store.removeProviderOwnership(
+        body.client_id,
+        body.site_id,
+        provider,
+        body.externalAccountId,
       );
       res.status(204).end();
     }),
@@ -388,9 +431,11 @@ export function createApp(
       const message =
         error instanceof TokenError
           ? "invalid or expired token"
-          : error instanceof Error
+          : error instanceof HttpError
             ? error.message
-            : "internal server error";
+            : status < 500
+              ? "malformed request"
+              : "internal server error";
 
       res.status(status).json({
         error: errorCodeForStatus(status),
@@ -410,12 +455,87 @@ function securityHeaders(_req: Request, res: Response, next: NextFunction): void
   res.setHeader("Cache-Control", "no-store, max-age=0");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
   next();
+}
+
+function brokerStateCookieName(provider: Provider): string {
+  return `aoc_oauth_${provider}`;
+}
+
+function brokerStateCookieValue(stateId: string, secret: string): string {
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`admitone-browser-state-v1\0${stateId}`, "utf8")
+    .digest("base64url");
+}
+
+function brokerStateCookieOptions(config: AppConfig, provider: Provider) {
+  return {
+    httpOnly: true,
+    maxAge: BROKER_STATE_TTL_SECONDS * 1_000,
+    path: `/connect/${provider}/callback`,
+    sameSite: "lax" as const,
+    secure: new URL(config.brokerPublicUrl).protocol === "https:",
+  };
+}
+
+function setBrokerStateCookie(
+  res: Response,
+  config: AppConfig,
+  provider: Provider,
+  stateId: string,
+): void {
+  res.cookie(
+    brokerStateCookieName(provider),
+    brokerStateCookieValue(stateId, config.brokerSigningSecret),
+    brokerStateCookieOptions(config, provider),
+  );
+}
+
+function clearBrokerStateCookie(
+  res: Response,
+  config: AppConfig,
+  provider: Provider,
+): void {
+  const { maxAge: _maxAge, ...options } = brokerStateCookieOptions(config, provider);
+  res.clearCookie(brokerStateCookieName(provider), options);
+}
+
+function hasValidBrokerStateCookie(
+  req: Request,
+  config: AppConfig,
+  provider: Provider,
+  stateId: string,
+): boolean {
+  const name = brokerStateCookieName(provider);
+  const rawCookie = req.header("cookie") ?? "";
+  let candidate = "";
+  for (const part of rawCookie.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
+    try {
+      candidate = decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      return false;
+    }
+    break;
+  }
+  const expected = brokerStateCookieValue(stateId, config.brokerSigningSecret);
+  const candidateBuffer = Buffer.from(candidate, "utf8");
+  const expectedBuffer = Buffer.from(expected, "utf8");
+  const comparable =
+    candidateBuffer.length === expectedBuffer.length
+      ? candidateBuffer
+      : Buffer.alloc(expectedBuffer.length);
+  return (
+    crypto.timingSafeEqual(comparable, expectedBuffer) &&
+    candidateBuffer.length === expectedBuffer.length
+  );
 }
 
 async function authenticateServiceRequest<T extends ServiceRequestEnvelope>(
@@ -618,16 +738,22 @@ function validateSquareRefreshToken(
   return payload;
 }
 
+function providerExternalAccountId(
+  provider: Provider,
+  data: StripeHandoffData | SquareHandoffData,
+): string {
+  return provider === "stripe"
+    ? (data as StripeHandoffData).stripeUserId
+    : (data as SquareHandoffData).merchantId;
+}
+
 async function compensateAuthorization(
   config: AppConfig,
   guard: ProviderCallGuard,
   provider: Provider,
   data: StripeHandoffData | SquareHandoffData,
 ): Promise<void> {
-  const externalAccountId =
-    provider === "stripe"
-      ? (data as StripeHandoffData).stripeUserId
-      : (data as SquareHandoffData).merchantId;
+  const externalAccountId = providerExternalAccountId(provider, data);
   try {
     await guard.run(provider, () =>
       revokeProviderAccess(config, provider, { externalAccountId }),

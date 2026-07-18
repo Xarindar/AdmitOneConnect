@@ -90,6 +90,7 @@ function buildStripeAuthorizeUrl(config: AppConfig, brokerState: string): string
 function buildSquareAuthorizeUrl(config: AppConfig, brokerState: string): string {
   const url = new URL(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/authorize`);
   url.searchParams.set("client_id", config.squareAppId);
+  url.searchParams.set("redirect_uri", providerCallbackUrl(config, "square"));
   url.searchParams.set("scope", config.squareOAuthScopes.join(" "));
   url.searchParams.set("state", brokerState);
   if (config.squareOAuthEnv === "production") {
@@ -124,10 +125,17 @@ export async function exchangeStripeCode(
   }
 
   const accessToken = readString(body, "access_token");
-  const refreshToken = readString(body, "refresh_token");
+  const refreshToken = readOptionalString(body, "refresh_token");
   const stripeUserId = readString(body, "stripe_user_id");
   const scope = readString(body, "scope");
   const livemode = readBoolean(body, "livemode");
+  const expectedLivemode = config.stripePlatformSecretKey.startsWith("sk_live_");
+  if (livemode !== expectedLivemode) {
+    throw new ProviderExchangeError("Stripe token mode does not match the configured platform key");
+  }
+  if (scope !== "read_write") {
+    throw new ProviderExchangeError("Stripe did not grant the required read_write scope");
+  }
 
   return { accessToken, refreshToken, stripeUserId, livemode, scope };
 }
@@ -141,6 +149,7 @@ export async function exchangeSquareCode(
     {
       code,
       grant_type: "authorization_code",
+      redirect_uri: providerCallbackUrl(config, "square"),
     },
     "Square token exchange failed",
   );
@@ -304,6 +313,12 @@ function readString(body: unknown, field: string): string {
     return body[field];
   }
   throw new ProviderExchangeError(`Provider response missing ${field}`);
+}
+
+function readOptionalString(body: unknown, field: string): string {
+  if (!isRecord(body) || body[field] === undefined || body[field] === null) return "";
+  if (typeof body[field] === "string") return body[field];
+  throw new ProviderExchangeError(`Provider response has invalid ${field}`);
 }
 
 function readBoolean(body: unknown, field: string): boolean {

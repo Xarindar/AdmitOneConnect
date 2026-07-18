@@ -11,6 +11,11 @@ export interface HandoffRecord {
   expiresAt: number;
 }
 
+export interface RateLimitResult {
+  count: number;
+  resetAt: number;
+}
+
 export interface ArtifactStore {
   initialize(): Promise<void>;
   close(): Promise<void>;
@@ -23,6 +28,25 @@ export interface ArtifactStore {
     code: string,
     expected: Pick<HandoffRecord, "clientId" | "siteId" | "provider" | "nonce">,
   ): Promise<HandoffRecord | undefined>;
+  registerProviderOwnership(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<void>;
+  isProviderOwnedBy(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<boolean>;
+  removeProviderOwnership(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<void>;
+  hitRateLimit(key: string, windowMs: number): Promise<RateLimitResult>;
 }
 
 type MemoryEntry = {
@@ -33,6 +57,8 @@ type MemoryEntry = {
 
 export class MemoryArtifactStore implements ArtifactStore {
   private readonly entries = new Map<string, MemoryEntry>();
+  private readonly providerOwners = new Map<string, { clientId: string; siteId: string }>();
+  private readonly rateLimits = new Map<string, { count: number; resetAt: number }>();
 
   async initialize(): Promise<void> {}
   async close(): Promise<void> {}
@@ -80,6 +106,52 @@ export class MemoryArtifactStore implements ArtifactStore {
     }
     this.entries.delete(key);
     return handoff;
+  }
+
+  async registerProviderOwnership(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<void> {
+    this.providerOwners.set(providerOwnerDigest(provider, externalAccountId), { clientId, siteId });
+  }
+
+  async isProviderOwnedBy(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<boolean> {
+    const owner = this.providerOwners.get(providerOwnerDigest(provider, externalAccountId));
+    return owner?.clientId === clientId && owner.siteId === siteId;
+  }
+
+  async removeProviderOwnership(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<void> {
+    const key = providerOwnerDigest(provider, externalAccountId);
+    const owner = this.providerOwners.get(key);
+    if (owner?.clientId === clientId && owner.siteId === siteId) {
+      this.providerOwners.delete(key);
+    }
+  }
+
+  async hitRateLimit(key: string, windowMs: number): Promise<RateLimitResult> {
+    const now = Date.now();
+    for (const [candidate, value] of this.rateLimits) {
+      if (value.resetAt <= now) this.rateLimits.delete(candidate);
+    }
+    const digestKey = digest("rate-limit", key);
+    const current = this.rateLimits.get(digestKey);
+    const next = !current || current.resetAt <= now
+      ? { count: 1, resetAt: now + windowMs }
+      : { count: current.count + 1, resetAt: current.resetAt };
+    this.rateLimits.set(digestKey, next);
+    return next;
   }
 
   private register(kind: "state" | "request", id: string, expiresAt: number): boolean {
@@ -136,6 +208,32 @@ export class PostgresArtifactStore implements ArtifactStore {
     await this.pool.query(`
       CREATE INDEX IF NOT EXISTS admitone_connect_artifacts_expiry_idx
       ON admitone_connect_artifacts (expires_at)
+    `);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS admitone_connect_provider_owners (
+        account_digest TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK (provider IN ('stripe', 'square')),
+        client_id TEXT NOT NULL,
+        site_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS admitone_connect_provider_owners_client_idx
+      ON admitone_connect_provider_owners (client_id, site_id, provider)
+    `);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS admitone_connect_rate_limits (
+        key_digest TEXT PRIMARY KEY,
+        window_start TIMESTAMPTZ NOT NULL,
+        count INTEGER NOT NULL CHECK (count > 0),
+        expires_at TIMESTAMPTZ NOT NULL
+      )
+    `);
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS admitone_connect_rate_limits_expiry_idx
+      ON admitone_connect_rate_limits (expires_at)
     `);
     await this.prune();
   }
@@ -228,6 +326,90 @@ export class PostgresArtifactStore implements ArtifactStore {
     };
   }
 
+  async registerProviderOwnership(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO admitone_connect_provider_owners
+        (account_digest, provider, client_id, site_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (account_digest) DO UPDATE
+       SET provider = EXCLUDED.provider,
+           client_id = EXCLUDED.client_id,
+           site_id = EXCLUDED.site_id,
+           updated_at = NOW()`,
+      [providerOwnerDigest(provider, externalAccountId), provider, clientId, siteId],
+    );
+  }
+
+  async isProviderOwnedBy(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1
+       FROM admitone_connect_provider_owners
+       WHERE account_digest = $1
+         AND provider = $2
+         AND client_id = $3
+         AND site_id = $4`,
+      [providerOwnerDigest(provider, externalAccountId), provider, clientId, siteId],
+    );
+    return result.rowCount === 1;
+  }
+
+  async removeProviderOwnership(
+    clientId: string,
+    siteId: string,
+    provider: Provider,
+    externalAccountId: string,
+  ): Promise<void> {
+    await this.pool.query(
+      `DELETE FROM admitone_connect_provider_owners
+       WHERE account_digest = $1
+         AND provider = $2
+         AND client_id = $3
+         AND site_id = $4`,
+      [providerOwnerDigest(provider, externalAccountId), provider, clientId, siteId],
+    );
+  }
+
+  async hitRateLimit(key: string, windowMs: number): Promise<RateLimitResult> {
+    const result = await this.pool.query<{ count: number; reset_at_ms: string }>(
+      `INSERT INTO admitone_connect_rate_limits
+        (key_digest, window_start, count, expires_at)
+       VALUES ($1, NOW(), 1, NOW() + ($2::BIGINT * INTERVAL '1 millisecond'))
+       ON CONFLICT (key_digest) DO UPDATE
+       SET count = CASE
+             WHEN admitone_connect_rate_limits.expires_at <= NOW() THEN 1
+             ELSE admitone_connect_rate_limits.count + 1
+           END,
+           window_start = CASE
+             WHEN admitone_connect_rate_limits.expires_at <= NOW() THEN NOW()
+             ELSE admitone_connect_rate_limits.window_start
+           END,
+           expires_at = CASE
+             WHEN admitone_connect_rate_limits.expires_at <= NOW()
+               THEN NOW() + ($2::BIGINT * INTERVAL '1 millisecond')
+             ELSE admitone_connect_rate_limits.expires_at
+           END
+       RETURNING count,
+         FLOOR(EXTRACT(EPOCH FROM expires_at) * 1000)::BIGINT AS reset_at_ms`,
+      [digest("rate-limit", key), windowMs],
+    );
+    if (crypto.randomInt(1_000) === 0) {
+      await this.pool.query("DELETE FROM admitone_connect_rate_limits WHERE expires_at <= NOW()");
+    }
+    const row = result.rows[0];
+    if (!row) throw new Error("rate limit update failed");
+    return { count: Number(row.count), resetAt: Number(row.reset_at_ms) };
+  }
+
   private async register(
     kind: "state" | "request",
     id: string,
@@ -245,9 +427,14 @@ export class PostgresArtifactStore implements ArtifactStore {
 
   private async prune(): Promise<void> {
     await this.pool.query("DELETE FROM admitone_connect_artifacts WHERE expires_at <= NOW()");
+    await this.pool.query("DELETE FROM admitone_connect_rate_limits WHERE expires_at <= NOW()");
   }
 }
 
 function digest(namespace: string, value: string): string {
   return crypto.createHash("sha256").update(`${namespace}\0${value}`, "utf8").digest("hex");
+}
+
+function providerOwnerDigest(provider: Provider, externalAccountId: string): string {
+  return digest("provider-owner", `${provider}\0${externalAccountId}`);
 }
