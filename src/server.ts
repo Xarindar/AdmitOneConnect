@@ -944,6 +944,26 @@ function errorName(error: unknown): string {
   return error instanceof Error ? error.name : "UnknownError";
 }
 
+function startupErrorDetail(error: unknown): string {
+  if (!(error instanceof Error)) return "initialization failed";
+  const safeConfigurationPrefixes = [
+    "PORT ",
+    "DATABASE_URL ",
+    "BROKER_PUBLIC_URL ",
+    "ADMITONE_CONNECT_SIGNING_SECRET ",
+    "ADMITONE_CONNECT_CLIENTS ",
+    "STRIPE_CONNECT_CLIENT_ID ",
+    "STRIPE_PLATFORM_SECRET_KEY ",
+    "SQUARE_APP_ID ",
+    "SQUARE_APP_SECRET ",
+    "SQUARE_OAUTH_ENV ",
+    "PROVIDER_TIMEOUT_MS ",
+  ];
+  return safeConfigurationPrefixes.some((prefix) => error.message.startsWith(prefix))
+    ? error.message
+    : "initialization failed";
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const registry = parseRegistry(process.env.ADMITONE_CONNECT_CLIENTS);
@@ -971,7 +991,10 @@ async function main(): Promise<void> {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   void main().catch((error) => {
-    console.error("AdmitOne Connect failed to start", { name: errorName(error) });
+    console.error("AdmitOne Connect failed to start", {
+      detail: startupErrorDetail(error),
+      name: errorName(error),
+    });
     process.exit(1);
   });
 }
