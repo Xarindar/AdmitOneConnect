@@ -4,6 +4,7 @@ export type SquareOAuthEnv = "production" | "sandbox";
 
 export interface AppConfig {
   port: number;
+  databaseUrl: string;
   brokerPublicUrl: string;
   brokerSigningSecret: string;
   stripeConnectClientId: string;
@@ -13,6 +14,7 @@ export interface AppConfig {
   squareOAuthEnv: SquareOAuthEnv;
   squareApiVersion: string;
   squareOAuthScopes: string[];
+  providerTimeoutMs: number;
 }
 
 const DEFAULT_SQUARE_SCOPES = [
@@ -21,13 +23,12 @@ const DEFAULT_SQUARE_SCOPES = [
   "PAYMENTS_WRITE",
   "ORDERS_READ",
   "ORDERS_WRITE",
-  "REFUNDS_READ",
-  "REFUNDS_WRITE",
 ];
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     port: parsePort(env.PORT),
+    databaseUrl: requireEnv(env, "DATABASE_URL"),
     brokerPublicUrl: normalizeHttpsBaseUrl(requireEnv(env, "BROKER_PUBLIC_URL"), "BROKER_PUBLIC_URL", {
       allowLocalhostHttp: true,
     }),
@@ -39,7 +40,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     squareOAuthEnv: parseSquareOAuthEnv(env.SQUARE_OAUTH_ENV),
     squareApiVersion: env.SQUARE_API_VERSION?.trim() || "2025-12-17",
     squareOAuthScopes: parseScopes(env.SQUARE_OAUTH_SCOPES),
+    providerTimeoutMs: parsePositiveInteger(env.PROVIDER_TIMEOUT_MS, 10_000, "PROVIDER_TIMEOUT_MS"),
   };
+}
+
+function parsePositiveInteger(raw: string | undefined, fallback: number, name: string): number {
+  if (!raw || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 60_000) {
+    throw new Error(`${name} must be an integer between 1 and 60000`);
+  }
+  return parsed;
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {

@@ -25,6 +25,10 @@ export interface SquareRefreshData {
   expiresAt: string;
 }
 
+export interface ProviderRevocationInput {
+  externalAccountId: string;
+}
+
 type ProviderHandoffData = StripeHandoffData | SquareHandoffData;
 
 export class ProviderExchangeError extends Error {
@@ -108,6 +112,7 @@ export async function exchangeStripeCode(
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: params,
+    signal: AbortSignal.timeout(config.providerTimeoutMs),
   });
 
   const body = await parseProviderJson(response);
@@ -169,6 +174,60 @@ export async function refreshSquareToken(
   };
 }
 
+export async function revokeProviderAccess(
+  config: AppConfig,
+  provider: Provider,
+  input: ProviderRevocationInput,
+): Promise<void> {
+  if (provider === "stripe") {
+    await revokeStripeAccess(config, input.externalAccountId);
+    return;
+  }
+  await revokeSquareAccess(config, input.externalAccountId);
+}
+
+async function revokeStripeAccess(config: AppConfig, stripeUserId: string): Promise<void> {
+  const body = new URLSearchParams({
+    client_id: config.stripeConnectClientId,
+    stripe_user_id: stripeUserId,
+  });
+  const response = await fetch("https://connect.stripe.com/oauth/deauthorize", {
+    method: "POST",
+    headers: {
+      authorization: `Basic ${Buffer.from(`${config.stripePlatformSecretKey}:`).toString("base64")}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body,
+    signal: AbortSignal.timeout(config.providerTimeoutMs),
+  });
+  const parsed = await parseProviderJson(response);
+  if (!response.ok || !isRecord(parsed) || parsed.stripe_user_id !== stripeUserId) {
+    throw new ProviderExchangeError(
+      providerErrorMessage("Stripe deauthorization failed", parsed),
+      response.status,
+    );
+  }
+}
+
+async function revokeSquareAccess(config: AppConfig, merchantId: string): Promise<void> {
+  const response = await fetch(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/revoke`, {
+    method: "POST",
+    headers: {
+      ...squareJsonHeaders(config),
+      authorization: `Client ${config.squareAppSecret}`,
+    },
+    body: JSON.stringify({ client_id: config.squareAppId, merchant_id: merchantId }),
+    signal: AbortSignal.timeout(config.providerTimeoutMs),
+  });
+  const parsed = await parseProviderJson(response);
+  if (!response.ok || !isRecord(parsed) || parsed.success !== true) {
+    throw new ProviderExchangeError(
+      providerErrorMessage("Square revocation failed", parsed),
+      response.status,
+    );
+  }
+}
+
 function squareBaseUrl(env: SquareOAuthEnv): string {
   return env === "sandbox"
     ? "https://connect.squareupsandbox.com"
@@ -195,6 +254,7 @@ async function squareTokenRequest(
       client_secret: config.squareAppSecret,
       ...fields,
     }),
+    signal: AbortSignal.timeout(config.providerTimeoutMs),
   });
 
   const body = await parseProviderJson(response);

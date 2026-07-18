@@ -7,8 +7,9 @@ AdmitOne Connect is a small OAuth broker for Showrunner payment onboarding. It h
 1. Showrunner redirects the admin to `/connect/{provider}/start?client_id=...&state=...` on this broker.
 2. The broker verifies the Showrunner-signed state token, checks that `returnUrl` belongs to the registered client origin, signs its own short-lived provider state, and redirects to Stripe or Square.
 3. The provider redirects back to this broker with `code` and `state`.
-4. The broker exchanges `code` with the platform secret, seals a 5-minute encrypted `handoff` token with the client's shared secret, and redirects to the original Showrunner callback.
-5. Showrunner opens the handoff and stores the merchant tokens encrypted in its own database. Square refresh tokens are returned as broker-sealed handles, not raw Square refresh tokens.
+4. The broker atomically consumes provider state, exchanges `code`, stores the encrypted token bundle server-side, and redirects to Showrunner with only a 256-bit opaque one-time code.
+5. Showrunner redeems that code through an authenticated back-channel request. The broker atomically consumes it and returns the site/provider/session-bound bundle with `Cache-Control: no-store`.
+6. Showrunner stores merchant tokens encrypted. Square refresh tokens remain broker-sealed handles rather than raw provider refresh tokens.
 
 Signed state tokens are HMAC-SHA256 compact tokens:
 
@@ -18,7 +19,7 @@ base64url(JSON payload) + "." + base64url(HMAC_SHA256(encoded_payload, shared_se
 
 Every token payload must include `typ`, `v`, `iat`, and an integer `exp`. Client state tokens use `typ: "admitone.client_state"`.
 
-Encrypted handoff and Square refresh-handle tokens use AES-256-GCM with keys derived from the same shared secret. Treat the token format as opaque and use the broker/client token helper implementation rather than parsing URL segments by hand.
+Square refresh-handle tokens and broker database payloads use AES-256-GCM. Browser-facing handoff codes contain no payload and are single-use. Durable Postgres records make state, code, and service-request replay protection work across replicas.
 
 ## Environment
 
@@ -26,6 +27,8 @@ Copy `.env.example` to `.env` and fill in the values:
 
 ```bash
 PORT=8080
+DATABASE_URL=postgresql://...
+PROVIDER_TIMEOUT_MS=10000
 BROKER_PUBLIC_URL=https://connect.example.com
 STRIPE_CONNECT_CLIENT_ID=ca_...
 STRIPE_PLATFORM_SECRET_KEY=sk_live_...
@@ -54,7 +57,7 @@ Square:
 - Create a Square Developer application.
 - Register `${BROKER_PUBLIC_URL}/connect/square/callback` as the OAuth redirect URL.
 - Use production or sandbox app credentials matching `SQUARE_OAUTH_ENV`.
-- By default the broker requests `MERCHANT_PROFILE_READ PAYMENTS_READ PAYMENTS_WRITE ORDERS_READ ORDERS_WRITE REFUNDS_READ REFUNDS_WRITE`. Override `SQUARE_OAUTH_SCOPES` only if the Showrunner integration changes.
+- By default the broker requests the documented `MERCHANT_PROFILE_READ PAYMENTS_READ PAYMENTS_WRITE ORDERS_READ ORDERS_WRITE` scopes. Override `SQUARE_OAUTH_SCOPES` only if the Showrunner integration changes.
 
 ## Square Refresh Endpoint
 
@@ -63,12 +66,14 @@ Showrunner refreshes Square tokens by calling:
 ```http
 POST /connect/square/refresh
 Content-Type: application/json
-X-AdmitOne-Signature: <base64url HMAC-SHA256 over the exact raw JSON body>
+X-AdmitOne-Signature: v1=<canonical-request HMAC-SHA256>
 
-{"client_id":"client_1","refreshToken":"<sealed-square-refresh-handle>","timestamp":1781900000,"nonce":"random-unique-value"}
+{"client_id":"client_1","site_id":"site_1","provider":"square","iat":1781900000,"exp":1781900300,"request_id":"random-unique-value","refreshToken":"<sealed-square-refresh-handle>"}
 ```
 
-`timestamp` is Unix time in seconds and must be within five minutes of broker time. `nonce` must be unique per client for that freshness window. The response returns a new sealed Square refresh handle in `refreshToken`.
+The signature binds version, method, path, client, site, provider, issued/expiry times, request ID, and an exact body digest. The request ID is durably single-use and the response returns a new site-bound sealed Square refresh handle.
+
+The same authenticated envelope is used for `POST /connect/handoff/redeem` and `POST /connect/{provider}/revoke`. Provider revocation happens before Showrunner removes its local encrypted credentials.
 
 The response is:
 
@@ -87,6 +92,7 @@ npm install
 npm run dev
 npm run build
 npm run lint
+npm test
 ```
 
 `GET /health` returns `{ "ok": true }`.
