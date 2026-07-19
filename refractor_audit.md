@@ -58,14 +58,14 @@ The one material item is a **Medium reliability defect**: a crash/rollback windo
 
 The rotation HTTP call to Square runs *inside* the Prisma transaction (`refreshSquarePkceToken`, `square-refresh.ts:202`), and the DB write that persists the new tokens runs afterward (`:212-225`), committing at `:229`. Square PKCE refresh tokens are **single-use and rotating** — confirmed against Square's OAuth docs: the PKCE flow returns a *new* refresh token and invalidates the old one (unlike the non-PKCE code flow, which reuses the same refresh token).
 
-**Failure scenario (no attacker required):** the cron acquires the advisory lock, decrypts the old refresh token, and calls Square, which rotates it (old token now dead at Square). If the process is then killed (Railway SIGTERM during redeploy, the 20 s transaction timeout firing mid-commit at `:229`, a Postgres failover, or a pod eviction) before the transaction commits, the DB rolls back to the *old, now-invalid* refresh token and the new token is lost forever. Every subsequent refresh sends the dead token → Square returns `invalid_grant` → the credential can no longer refresh. The 30-day access token keeps payments working for up to ~23 more days (cadence is 7 days), then `getSquareAccessToken` (`credentials.ts:176`) throws "connection expired," and the merchant must manually reconnect.
+**Failure scenario (no attacker required):** the cron acquires the advisory lock, decrypts the old refresh token, and calls Square, which rotates it (old token now dead at Square). If the process is then killed (Railway SIGTERM during redeploy, the 20 s transaction timeout firing mid-commit at `:229`, a Postgres failover, or a pod eviction) before the transaction commits, the DB rolls back to the *old, now-invalid* refresh token and the new token is lost forever. Every subsequent refresh sends the dead token → Square returns `invalid_grant` → the credential can no longer refresh. Depending on when the failed rotation occurs, the 30-day access token leaves approximately 23–30 days to reconnect (the normal refresh cadence is 7 days); after expiry, `getSquareAccessToken` (`credentials.ts:176`) throws "connection expired."
 
-**Why Medium, not High:** requires an unlucky crash in a narrow window; the cron runs a single replica (low concurrency); ~23-day recovery buffer; currently zero connected merchants. But it is a *confirmed* correctness defect, not hardening.
+**Why Medium, not High:** requires an unlucky crash in a narrow window; the cron runs a single replica (low concurrency); approximately 23–30 days of access-token recovery time; currently zero connected merchants. But it is a *confirmed* correctness defect, not hardening.
 
-**Recommended fixes (any one closes most of the gap):**
-1. **Tolerate both tokens.** Persist the previous refresh token alongside the current one; on `invalid_grant`, retry once with the other. Survives a lost commit because whichever token Square still honors will work.
-2. **Detect `invalid_grant` → downgrade + alert.** On a refresh failure that is specifically an invalid/expired refresh token, set the credential `status = ERROR` and surface a "reconnect Square" prompt, instead of leaving it `CONNECTED` and silently failing daily (see L1).
-3. Keep the Square call inside the transaction (that ordering is deliberate and correct for advisory-lock atomicity) but shrink the exposure — the DB `update` is already the next statement; additionally consider committing the freshly received refresh token in its own statement immediately.
+**Recommended mitigations:** Square exposes no idempotency key or recovery endpoint for a newly issued PKCE refresh token, so database ordering alone cannot make the provider rotation and local commit atomic. Retaining the previous token does not recover a lost commit—the database-held token has already been consumed—and another Prisma statement inside the same transaction is not an independent durable commit.
+1. **Detect `invalid_grant` → downgrade + alert.** On a refresh failure that is specifically an invalid/expired refresh token, set the credential `status = ERROR`, retain the still-valid access token during its grace period, and surface a "reconnect Square" prompt instead of leaving the credential silently `CONNECTED` (see L1).
+2. **Shrink, but do not claim to eliminate, the exposure.** Move unrelated work outside the transaction and durably persist the returned token as the immediate next operation. A process failure can still occur between Square's response and that commit.
+3. **Use a non-rotating provider primitive if full automatic recovery is mandatory.** That requires a provider-supported idempotent token exchange/retrieval mechanism or moving this server-side integration to Square's confidential code flow with its multi-use refresh token, which changes the current no-application-secret architecture.
 
 ### 🟢 Low
 
@@ -119,7 +119,7 @@ The Connect-revoke branch is gated on `provider === STRIPE` (`:248`); Square OAu
 
 - **Live Stripe/Square token exchange, webhook signatures, and refunds** need real provider accounts and sandbox credentials; verified by code trace, mocked-`fetch` unit tests, and schema/flow, not against live Stripe/Square. The M1 crash window in particular can only be *proven* end-to-end with a real Square PKCE credential and an induced crash.
 - **Secret *values*** on Railway were deliberately not read; only variable presence/absence was confirmed. Shared-secret consistency between Connect's `ADMITONE_CONNECT_CLIENTS` and Showrunner's `ADMITONE_CONNECT_SHARED_SECRET` is implied by healthy operation, not value comparison.
-- **Priorities:** M1 (confirmed, Medium) first, then L1 and L3. Only M1 is a confirmed defect.
+- **Priorities:** M1 (confirmed, Medium) first, then L1 (confirmed Low detection gap) and L3.
 
 ---
 
