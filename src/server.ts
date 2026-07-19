@@ -11,14 +11,13 @@ import { loadConfig, type AppConfig } from "./lib/config.js";
 import { isRecord } from "./lib/objects.js";
 import {
   buildAuthorizeUrl,
-  exchangeProviderCode,
+  createSquareCodeHandoff,
+  exchangeStripeCode,
   isProvider,
   ProviderExchangeError,
-  refreshSquareToken,
   revokeProviderAccess,
   type Provider,
   type SquareHandoffData,
-  type SquareRefreshData,
   type StripeHandoffData,
 } from "./lib/providers.js";
 import { rateLimit } from "./lib/rate-limit.js";
@@ -38,7 +37,6 @@ import { open, seal, sign, TokenError, verify } from "./lib/tokens.js";
 const BROKER_STATE_TTL_SECONDS = 10 * 60;
 const HANDOFF_TTL_SECONDS = 5 * 60;
 const SERVICE_REQUEST_TTL_SECONDS = 5 * 60;
-const SQUARE_REFRESH_HANDLE_TTL_SECONDS = 365 * 24 * 60 * 60;
 
 interface ClientStatePayload {
   typ: typeof TOKEN_TYPES.clientState;
@@ -47,6 +45,7 @@ interface ClientStatePayload {
   provider: Provider;
   returnUrl: string;
   nonce: string;
+  codeChallenge?: string;
   iat: number;
   exp: number;
 }
@@ -75,27 +74,10 @@ interface HandoffPayload {
   exp: number;
 }
 
-interface SquareRefreshTokenPayload {
-  typ: typeof TOKEN_TYPES.squareRefresh;
-  v: 1;
-  provider: "square";
-  clientId: string;
-  siteId: string;
-  merchantId: string;
-  refreshToken: string;
-  iat: number;
-  exp: number;
-}
-
 interface HandoffRedeemBody extends ServiceRequestEnvelope {
   provider: Provider;
   code: string;
   nonce: string;
-}
-
-interface SquareRefreshBody extends ServiceRequestEnvelope {
-  provider: "square";
-  refreshToken: string;
 }
 
 interface RevokeBody extends ServiceRequestEnvelope {
@@ -194,6 +176,7 @@ export function createApp(
         config,
         provider,
         sign(brokerState, config.brokerSigningSecret),
+        clientState.codeChallenge,
       );
       res.redirect(302, redirectUrl);
     }),
@@ -238,17 +221,9 @@ export function createApp(
       const now = nowSeconds();
       let data: StripeHandoffData | SquareHandoffData;
       try {
-        const exchanged = await providerCalls.run(provider, () =>
-          exchangeProviderCode(config, provider, code),
-        );
-        data = prepareHandoffData(
-          exchanged,
-          provider,
-          client,
-          state.clientId,
-          state.clientState.siteId,
-          now,
-        );
+        data = provider === "stripe"
+          ? await providerCalls.run("stripe", () => exchangeStripeCode(config, code))
+          : createSquareCodeHandoff(config, code);
       } catch (error) {
         logProviderFailure("token_exchange", provider, error);
         redirectToClientError(
@@ -273,13 +248,17 @@ export function createApp(
         exp: now + HANDOFF_TTL_SECONDS,
       };
       const opaqueCode = randomOpaqueValue();
-      const externalAccountId = providerExternalAccountId(provider, data);
-      await store.registerProviderOwnership(
-        state.clientId,
-        handoff.siteId,
-        provider,
-        externalAccountId,
-      );
+      const stripeAccountId = provider === "stripe"
+        ? (data as StripeHandoffData).stripeUserId
+        : undefined;
+      if (stripeAccountId) {
+        await store.registerProviderOwnership(
+          state.clientId,
+          handoff.siteId,
+          "stripe",
+          stripeAccountId,
+        );
+      }
       try {
         await store.putHandoff(opaqueCode, {
           clientId: state.clientId,
@@ -294,13 +273,19 @@ export function createApp(
           expiresAt: handoff.exp,
         });
       } catch (error) {
-        await store.removeProviderOwnership(
-          state.clientId,
-          handoff.siteId,
-          provider,
-          externalAccountId,
-        );
-        await compensateAuthorization(config, providerCalls, provider, data);
+        if (stripeAccountId) {
+          await store.removeProviderOwnership(
+            state.clientId,
+            handoff.siteId,
+            "stripe",
+            stripeAccountId,
+          );
+          await compensateStripeAuthorization(
+            config,
+            providerCalls,
+            data as StripeHandoffData,
+          );
+        }
         throw error;
       }
 
@@ -337,42 +322,10 @@ export function createApp(
   );
 
   app.post(
-    "/connect/square/refresh",
-    rateLimit(store, { keyPrefix: "square-refresh", limit: 60, windowMs: 5 * 60_000 }),
-    asyncRoute(async (req, res) => {
-      const body = validateSquareRefreshBody(req.body);
-      const client = await authenticateServiceRequest(req, body, registry, store);
-      const refreshHandle = validateSquareRefreshToken(
-        open<SquareRefreshTokenPayload>(
-          body.refreshToken,
-          client.secret,
-          TOKEN_TYPES.squareRefresh,
-        ),
-        body.client_id,
-        body.site_id,
-      );
-
-      const refreshed = await providerCalls.run("square", () =>
-        refreshSquareToken(config, refreshHandle.refreshToken),
-      );
-      res.json(
-        sealSquareRefreshResponse(
-          refreshed,
-          client,
-          body.client_id,
-          body.site_id,
-          refreshHandle.merchantId,
-          nowSeconds(),
-        ),
-      );
-    }),
-  );
-
-  app.post(
-    "/connect/:provider/revoke",
+    "/connect/stripe/revoke",
     rateLimit(store, { keyPrefix: "provider-revoke", limit: 30, windowMs: 10 * 60_000 }),
     asyncRoute(async (req, res) => {
-      const provider = parseProvider(req.params.provider);
+      const provider = "stripe" as const;
       const body = validateRevokeBody(req.body, provider);
       await authenticateServiceRequest(req, body, registry, store);
       const owned = await store.isProviderOwnedBy(
@@ -606,18 +559,6 @@ function validateHandoffRedeemBody(body: unknown): HandoffRedeemBody {
   return body as unknown as HandoffRedeemBody;
 }
 
-function validateSquareRefreshBody(body: unknown): SquareRefreshBody {
-  if (
-    !isRecord(body) ||
-    body.provider !== "square" ||
-    typeof body.refreshToken !== "string" ||
-    body.refreshToken.trim() === ""
-  ) {
-    throw new HttpError(400, "malformed Square refresh request");
-  }
-  return body as unknown as SquareRefreshBody;
-}
-
 function validateRevokeBody(body: unknown, provider: Provider): RevokeBody {
   if (
     !isRecord(body) ||
@@ -650,116 +591,17 @@ function validateHandoff(
   return payload;
 }
 
-function prepareHandoffData(
-  data: StripeHandoffData | SquareHandoffData,
-  provider: Provider,
-  client: ClientEntry,
-  clientId: string,
-  siteId: string,
-  now: number,
-): StripeHandoffData | SquareHandoffData {
-  if (provider === "stripe") return data as StripeHandoffData;
-  const square = data as SquareHandoffData;
-  return {
-    ...square,
-    refreshToken: sealSquareRefreshToken(
-      square.refreshToken,
-      client,
-      clientId,
-      siteId,
-      square.merchantId,
-      now,
-    ),
-  };
-}
-
-function sealSquareRefreshResponse(
-  data: SquareRefreshData,
-  client: ClientEntry,
-  clientId: string,
-  siteId: string,
-  merchantId: string,
-  now: number,
-): SquareRefreshData {
-  return {
-    ...data,
-    refreshToken: sealSquareRefreshToken(
-      data.refreshToken,
-      client,
-      clientId,
-      siteId,
-      merchantId,
-      now,
-    ),
-  };
-}
-
-function sealSquareRefreshToken(
-  refreshToken: string,
-  client: ClientEntry,
-  clientId: string,
-  siteId: string,
-  merchantId: string,
-  now: number,
-): string {
-  const payload: SquareRefreshTokenPayload = {
-    typ: TOKEN_TYPES.squareRefresh,
-    v: 1,
-    provider: "square",
-    clientId,
-    siteId,
-    merchantId,
-    refreshToken,
-    iat: now,
-    exp: now + SQUARE_REFRESH_HANDLE_TTL_SECONDS,
-  };
-  return seal(payload, client.secret, TOKEN_TYPES.squareRefresh);
-}
-
-function validateSquareRefreshToken(
-  payload: SquareRefreshTokenPayload,
-  clientId: string,
-  siteId: string,
-): SquareRefreshTokenPayload {
-  if (
-    !isRecord(payload) ||
-    payload.typ !== TOKEN_TYPES.squareRefresh ||
-    payload.v !== 1 ||
-    payload.provider !== "square" ||
-    payload.clientId !== clientId ||
-    payload.siteId !== siteId ||
-    typeof payload.merchantId !== "string" ||
-    payload.merchantId.trim() === "" ||
-    typeof payload.refreshToken !== "string" ||
-    payload.refreshToken.trim() === ""
-  ) {
-    throw new HttpError(401, "invalid refresh token");
-  }
-  return payload;
-}
-
-function providerExternalAccountId(
-  provider: Provider,
-  data: StripeHandoffData | SquareHandoffData,
-): string {
-  return provider === "stripe"
-    ? (data as StripeHandoffData).stripeUserId
-    : (data as SquareHandoffData).merchantId;
-}
-
-async function compensateAuthorization(
+async function compensateStripeAuthorization(
   config: AppConfig,
   guard: ProviderCallGuard,
-  provider: Provider,
-  data: StripeHandoffData | SquareHandoffData,
+  data: StripeHandoffData,
 ): Promise<void> {
-  const externalAccountId = providerExternalAccountId(provider, data);
   try {
-    await guard.run(provider, () =>
-      revokeProviderAccess(config, provider, { externalAccountId }),
+    await guard.run("stripe", () =>
+      revokeProviderAccess(config, "stripe", { externalAccountId: data.stripeUserId }),
     );
   } catch (error) {
-    logProviderFailure("compensating_revoke", provider, error);
+    logProviderFailure("compensating_revoke", "stripe", error);
   }
 }
 
@@ -861,6 +703,16 @@ function validateClientState(
       throw new HttpError(400, "client state is invalid");
     }
   }
+  if (
+    expectedProvider === "square" &&
+    (typeof payload.codeChallenge !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(payload.codeChallenge))
+  ) {
+    throw new HttpError(400, "Square client state requires a PKCE code challenge");
+  }
+  if (expectedProvider === "stripe" && payload.codeChallenge !== undefined) {
+    throw new HttpError(400, "Stripe client state must not include a PKCE code challenge");
+  }
   if (!Number.isInteger(payload.iat) || !Number.isInteger(payload.exp)) {
     throw new HttpError(400, "client state is invalid");
   }
@@ -955,7 +807,6 @@ function startupErrorDetail(error: unknown): string {
     "STRIPE_CONNECT_CLIENT_ID ",
     "STRIPE_PLATFORM_SECRET_KEY ",
     "SQUARE_APP_ID ",
-    "SQUARE_APP_SECRET ",
     "SQUARE_OAUTH_ENV ",
     "PROVIDER_TIMEOUT_MS ",
   ];

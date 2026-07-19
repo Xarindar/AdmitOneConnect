@@ -17,7 +17,7 @@ const attackerClientSecret = "other-tenant-secret-with-sufficient-entropy";
 const brokerSecret = "test-broker-secret-with-sufficient-entropy";
 const originalFetch = globalThis.fetch;
 let providerExchangeCount = 0;
-let squareRefreshCount = 0;
+let squareTokenExchangeCount = 0;
 let stripeRevokeCount = 0;
 
 const config: AppConfig = {
@@ -28,7 +28,6 @@ const config: AppConfig = {
   stripeConnectClientId: "ca_test",
   stripePlatformSecretKey: "sk_test_placeholder",
   squareAppId: "square-test",
-  squareAppSecret: "square-secret",
   squareOAuthEnv: "sandbox",
   squareApiVersion: "2026-05-20",
   squareOAuthScopes: ["PAYMENTS_READ", "PAYMENTS_WRITE"],
@@ -71,23 +70,17 @@ before(async () => {
       });
     }
     if (url.hostname === "connect.squareupsandbox.com" && url.pathname === "/oauth2/token") {
-      const rawBody = typeof init?.body === "string" ? init.body : "{}";
-      const body = JSON.parse(rawBody) as { grant_type?: string };
-      if (body.grant_type === "refresh_token") squareRefreshCount += 1;
-      return new Response(JSON.stringify({
-        access_token: body.grant_type === "refresh_token" ? "square-access-refreshed" : "square-access-initial",
-        refresh_token: "square-provider-refresh-secret",
-        merchant_id: "merchant-1",
-        expires_at: "2026-08-18T00:00:00Z",
-      }), { status: 200, headers: { "content-type": "application/json" } });
+      squareTokenExchangeCount += 1;
+      throw new Error("Connect must never exchange Square PKCE authorization codes");
     }
     return originalFetch(input, init);
   };
 });
 
-test("Square refresh signatures are site/path/time bound and exact replay stops before the provider", async () => {
+test("Square PKCE handoff returns only the authorization code and Connect never receives merchant tokens", async () => {
   const now = Math.floor(Date.now() / 1000);
   const nonce = "square-browser-session";
+  const codeChallenge = "A".repeat(43);
   const clientState = sign({
     typ: TOKEN_TYPES.clientState,
     v: 1,
@@ -95,6 +88,7 @@ test("Square refresh signatures are site/path/time bound and exact replay stops 
     provider: "square",
     returnUrl: "https://client.example.com/api/payments/connect/square/callback",
     nonce,
+    codeChallenge,
     iat: now,
     exp: now + 600,
   }, clientSecret);
@@ -103,6 +97,8 @@ test("Square refresh signatures are site/path/time bound and exact replay stops 
     { redirect: "manual" },
   );
   const authorizeUrl = new URL(assertString(start.headers.get("location")));
+  assert.equal(authorizeUrl.searchParams.get("code_challenge"), codeChallenge);
+  assert.equal(authorizeUrl.searchParams.get("client_id"), config.squareAppId);
   const callback = await originalFetch(
     `${baseUrl}/connect/square/callback?code=square-code&state=${encodeURIComponent(assertString(authorizeUrl.searchParams.get("state")))}`,
     { redirect: "manual", headers: { cookie: cookieHeader(start) } },
@@ -120,45 +116,58 @@ test("Square refresh signatures are site/path/time bound and exact replay stops 
     body: redeemRaw,
   });
   assert.equal(redeem.status, 200);
-  const handoff = await redeem.json() as { handoff: { data: { refreshToken: string } } };
-  const refreshHandle = handoff.handoff.data.refreshToken;
-  assert.equal(refreshHandle.includes("square-provider-refresh-secret"), false);
-
-  const refreshBody = serviceEnvelope("site-square", "square", { refreshToken: refreshHandle });
-  const refreshRaw = JSON.stringify(refreshBody);
-  const refreshSignature = signServiceRequest("POST", "/connect/square/refresh", refreshRaw, refreshBody, clientSecret);
-  const refresh = await originalFetch(`${baseUrl}/connect/square/refresh`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-admitone-signature": refreshSignature },
-    body: refreshRaw,
+  const handoff = await redeem.json() as {
+    handoff: {
+      data: Record<string, unknown>;
+    };
+  };
+  assert.deepEqual(handoff.handoff.data, {
+    authorizationCode: "square-code",
+    clientId: config.squareAppId,
+    redirectUri: `${config.brokerPublicUrl}/connect/square/callback`,
+    environment: "sandbox",
+    squareVersion: config.squareApiVersion,
   });
-  assert.equal(refresh.status, 200);
-  assert.equal(squareRefreshCount, 1);
+  assert.equal("accessToken" in handoff.handoff.data, false);
+  assert.equal("refreshToken" in handoff.handoff.data, false);
+  assert.equal(squareTokenExchangeCount, 0);
 
-  const replay = await originalFetch(`${baseUrl}/connect/square/refresh`, {
+  const replayBody = serviceEnvelope("site-square", "square", { code: opaqueCode, nonce });
+  const replayRaw = JSON.stringify(replayBody);
+  const replay = await originalFetch(`${baseUrl}/connect/handoff/redeem`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-admitone-signature": refreshSignature },
-    body: refreshRaw,
+    headers: {
+      "content-type": "application/json",
+      "x-admitone-signature": signServiceRequest(
+        "POST",
+        "/connect/handoff/redeem",
+        replayRaw,
+        replayBody,
+        clientSecret,
+      ),
+    },
+    body: replayRaw,
   });
   assert.equal(replay.status, 409);
-  assert.equal(squareRefreshCount, 1);
+});
 
-  const substitutedPathBody = serviceEnvelope("site-square", "square", { refreshToken: refreshHandle });
-  const substitutedRaw = JSON.stringify(substitutedPathBody);
-  const wrongPathSignature = signServiceRequest(
-    "POST",
-    "/connect/handoff/redeem",
-    substitutedRaw,
-    substitutedPathBody,
-    clientSecret,
+test("Square connection start rejects a missing PKCE challenge", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const clientState = sign({
+    typ: TOKEN_TYPES.clientState,
+    v: 1,
+    siteId: "site-square",
+    provider: "square",
+    returnUrl: "https://client.example.com/api/payments/connect/square/callback",
+    nonce: "missing-pkce",
+    iat: now,
+    exp: now + 600,
+  }, clientSecret);
+  const start = await originalFetch(
+    `${baseUrl}/connect/square/start?client_id=${clientId}&state=${encodeURIComponent(clientState)}`,
+    { redirect: "manual" },
   );
-  const substituted = await originalFetch(`${baseUrl}/connect/square/refresh`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-admitone-signature": wrongPathSignature },
-    body: substitutedRaw,
-  });
-  assert.equal(substituted.status, 401);
-  assert.equal(squareRefreshCount, 1);
+  assert.equal(start.status, 400);
 });
 
 after(async () => {
@@ -323,7 +332,6 @@ test("configuration rejects short or swapped credentials", () => {
     STRIPE_PLATFORM_SECRET_KEY: "sk_test_123456",
     SQUARE_OAUTH_ENV: "sandbox",
     SQUARE_APP_ID: "sandbox-sq0idb-example",
-    SQUARE_APP_SECRET: testSecret("square"),
   };
 
   assert.doesNotThrow(() => loadConfig(validEnv));
@@ -334,13 +342,6 @@ test("configuration rejects short or swapped credentials", () => {
   assert.throws(
     () => loadConfig({ ...validEnv, ADMITONE_CONNECT_SIGNING_SECRET: "too-short" }),
     /at least 32 characters/,
-  );
-  assert.doesNotThrow(
-    () => loadConfig({ ...validEnv, SQUARE_APP_SECRET: "provider-issued" }),
-  );
-  assert.throws(
-    () => loadConfig({ ...validEnv, SQUARE_APP_SECRET: validEnv.SQUARE_APP_ID }),
-    /SQUARE_APP_SECRET/,
   );
   assert.throws(
     () => parseRegistry(JSON.stringify({

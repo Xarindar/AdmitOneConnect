@@ -10,7 +10,6 @@ export interface AppConfig {
   stripeConnectClientId: string;
   stripePlatformSecretKey: string;
   squareAppId: string;
-  squareAppSecret: string;
   squareOAuthEnv: SquareOAuthEnv;
   squareApiVersion: string;
   squareOAuthScopes: string[];
@@ -56,7 +55,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         ? "a production Square application id beginning with sq0idp-"
         : "a sandbox Square application id beginning with sandbox-sq0idb-",
     ),
-    squareAppSecret: requireSquareSecret(env),
     squareOAuthEnv,
     squareApiVersion: env.SQUARE_API_VERSION?.trim() || "2025-12-17",
     squareOAuthScopes: parseScopes(env.SQUARE_OAUTH_SCOPES),
@@ -98,17 +96,6 @@ function requirePattern(
   const value = requireEnv(env, name);
   if (!pattern.test(value)) {
     throw new Error(`${name} must be ${description}`);
-  }
-  return value;
-}
-
-function requireSquareSecret(env: NodeJS.ProcessEnv): string {
-  // Square issues this credential, so its length is not under our control.
-  // Validate presence and guard against the common app-id/secret swap without
-  // imposing our entropy policy for locally generated secrets.
-  const value = requireEnv(env, "SQUARE_APP_SECRET");
-  if (/^(?:sq0idp-|sandbox-sq0idb-)/.test(value)) {
-    throw new Error("SQUARE_APP_SECRET must be an application secret, not a Square application id");
   }
   return value;
 }
