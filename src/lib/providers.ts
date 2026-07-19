@@ -12,24 +12,16 @@ export interface StripeHandoffData {
 }
 
 export interface SquareHandoffData {
-  accessToken: string;
-  refreshToken: string;
-  merchantId: string;
-  expiresAt: string;
+  authorizationCode: string;
+  clientId: string;
+  redirectUri: string;
   environment: SquareOAuthEnv;
-}
-
-export interface SquareRefreshData {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: string;
+  squareVersion: string;
 }
 
 export interface ProviderRevocationInput {
   externalAccountId: string;
 }
-
-type ProviderHandoffData = StripeHandoffData | SquareHandoffData;
 
 export class ProviderExchangeError extends Error {
   constructor(
@@ -52,30 +44,12 @@ export function buildAuthorizeUrl(
   config: AppConfig,
   provider: Provider,
   brokerState: string,
+  squareCodeChallenge?: string,
 ): string {
-  return authorizeUrlBuilders[provider](config, brokerState);
+  return provider === "stripe"
+    ? buildStripeAuthorizeUrl(config, brokerState)
+    : buildSquareAuthorizeUrl(config, brokerState, squareCodeChallenge);
 }
-
-export async function exchangeProviderCode(
-  config: AppConfig,
-  provider: Provider,
-  code: string,
-): Promise<ProviderHandoffData> {
-  return exchangeCodeHandlers[provider](config, code);
-}
-
-const authorizeUrlBuilders = {
-  stripe: buildStripeAuthorizeUrl,
-  square: buildSquareAuthorizeUrl,
-} satisfies Record<Provider, (config: AppConfig, brokerState: string) => string>;
-
-const exchangeCodeHandlers = {
-  stripe: exchangeStripeCode,
-  square: exchangeSquareCode,
-} satisfies Record<
-  Provider,
-  (config: AppConfig, code: string) => Promise<ProviderHandoffData>
->;
 
 function buildStripeAuthorizeUrl(config: AppConfig, brokerState: string): string {
   const url = new URL("https://connect.stripe.com/oauth/authorize");
@@ -87,9 +61,17 @@ function buildStripeAuthorizeUrl(config: AppConfig, brokerState: string): string
   return url.toString();
 }
 
-function buildSquareAuthorizeUrl(config: AppConfig, brokerState: string): string {
+function buildSquareAuthorizeUrl(
+  config: AppConfig,
+  brokerState: string,
+  codeChallenge?: string,
+): string {
+  if (!codeChallenge || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) {
+    throw new Error("Square PKCE code challenge is required");
+  }
   const url = new URL(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/authorize`);
   url.searchParams.set("client_id", config.squareAppId);
+  url.searchParams.set("code_challenge", codeChallenge);
   url.searchParams.set("redirect_uri", providerCallbackUrl(config, "square"));
   url.searchParams.set("scope", config.squareOAuthScopes.join(" "));
   url.searchParams.set("state", brokerState);
@@ -140,46 +122,16 @@ export async function exchangeStripeCode(
   return { accessToken, refreshToken, stripeUserId, livemode, scope };
 }
 
-export async function exchangeSquareCode(
+export function createSquareCodeHandoff(
   config: AppConfig,
-  code: string,
-): Promise<SquareHandoffData> {
-  const body = await squareTokenRequest(
-    config,
-    {
-      code,
-      grant_type: "authorization_code",
-      redirect_uri: providerCallbackUrl(config, "square"),
-    },
-    "Square token exchange failed",
-  );
-
+  authorizationCode: string,
+): SquareHandoffData {
   return {
-    accessToken: readString(body, "access_token"),
-    refreshToken: readString(body, "refresh_token"),
-    merchantId: readString(body, "merchant_id"),
-    expiresAt: readString(body, "expires_at"),
+    authorizationCode,
+    clientId: config.squareAppId,
+    redirectUri: providerCallbackUrl(config, "square"),
     environment: config.squareOAuthEnv,
-  };
-}
-
-export async function refreshSquareToken(
-  config: AppConfig,
-  refreshToken: string,
-): Promise<SquareRefreshData> {
-  const body = await squareTokenRequest(
-    config,
-    {
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-    },
-    "Square refresh failed",
-  );
-
-  return {
-    accessToken: readString(body, "access_token"),
-    refreshToken: readString(body, "refresh_token"),
-    expiresAt: readString(body, "expires_at"),
+    squareVersion: config.squareApiVersion,
   };
 }
 
@@ -188,11 +140,10 @@ export async function revokeProviderAccess(
   provider: Provider,
   input: ProviderRevocationInput,
 ): Promise<void> {
-  if (provider === "stripe") {
-    await revokeStripeAccess(config, input.externalAccountId);
-    return;
+  if (provider !== "stripe") {
+    throw new ProviderExchangeError("Square PKCE access must be revoked by the seller");
   }
-  await revokeSquareAccess(config, input.externalAccountId);
+  await revokeStripeAccess(config, input.externalAccountId);
 }
 
 async function revokeStripeAccess(config: AppConfig, stripeUserId: string): Promise<void> {
@@ -218,60 +169,10 @@ async function revokeStripeAccess(config: AppConfig, stripeUserId: string): Prom
   }
 }
 
-async function revokeSquareAccess(config: AppConfig, merchantId: string): Promise<void> {
-  const response = await fetch(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/revoke`, {
-    method: "POST",
-    headers: {
-      ...squareJsonHeaders(config),
-      authorization: `Client ${config.squareAppSecret}`,
-    },
-    body: JSON.stringify({ client_id: config.squareAppId, merchant_id: merchantId }),
-    signal: AbortSignal.timeout(config.providerTimeoutMs),
-  });
-  const parsed = await parseProviderJson(response);
-  if (!response.ok || !isRecord(parsed) || parsed.success !== true) {
-    throw new ProviderExchangeError(
-      providerErrorMessage("Square revocation failed", parsed),
-      response.status,
-    );
-  }
-}
-
 function squareBaseUrl(env: SquareOAuthEnv): string {
   return env === "sandbox"
     ? "https://connect.squareupsandbox.com"
     : "https://connect.squareup.com";
-}
-
-function squareJsonHeaders(config: AppConfig): Record<string, string> {
-  return {
-    "content-type": "application/json",
-    "square-version": config.squareApiVersion,
-  };
-}
-
-async function squareTokenRequest(
-  config: AppConfig,
-  fields: Record<string, string>,
-  errorPrefix: string,
-): Promise<unknown> {
-  const response = await fetch(`${squareBaseUrl(config.squareOAuthEnv)}/oauth2/token`, {
-    method: "POST",
-    headers: squareJsonHeaders(config),
-    body: JSON.stringify({
-      client_id: config.squareAppId,
-      client_secret: config.squareAppSecret,
-      ...fields,
-    }),
-    signal: AbortSignal.timeout(config.providerTimeoutMs),
-  });
-
-  const body = await parseProviderJson(response);
-  if (!response.ok) {
-    throw new ProviderExchangeError(providerErrorMessage(errorPrefix, body), response.status);
-  }
-
-  return body;
 }
 
 async function parseProviderJson(response: Response): Promise<unknown> {
