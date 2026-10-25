@@ -181,6 +181,7 @@ export class MemoryArtifactStore implements ArtifactStore {
 
 export class PostgresArtifactStore implements ArtifactStore {
   private readonly pool: Pool;
+  private cleanupTimer?: NodeJS.Timeout;
 
   constructor(databaseUrl: string) {
     this.pool = new Pool({
@@ -236,9 +237,14 @@ export class PostgresArtifactStore implements ArtifactStore {
       ON admitone_connect_rate_limits (expires_at)
     `);
     await this.prune();
+    this.cleanupTimer = setInterval(() => {
+      void this.prune().catch(() => console.error("expired artifact cleanup failed"));
+    }, 60_000);
+    this.cleanupTimer.unref();
   }
 
   async close(): Promise<void> {
+    clearInterval(this.cleanupTimer);
     await this.pool.end();
   }
 
@@ -426,8 +432,12 @@ export class PostgresArtifactStore implements ArtifactStore {
   }
 
   private async prune(): Promise<void> {
-    await this.pool.query("DELETE FROM admitone_connect_artifacts WHERE expires_at <= NOW()");
-    await this.pool.query("DELETE FROM admitone_connect_rate_limits WHERE expires_at <= NOW()");
+    for (const table of ["admitone_connect_artifacts", "admitone_connect_rate_limits"]) {
+      await this.pool.query(`DELETE FROM ${table} WHERE ctid IN (
+        SELECT ctid FROM ${table} WHERE expires_at <= NOW()
+        ORDER BY expires_at LIMIT 1000 FOR UPDATE SKIP LOCKED
+      )`);
+    }
   }
 }
 

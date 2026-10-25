@@ -323,6 +323,23 @@ function serviceBody(extra: { code: string; nonce: string; provider: "stripe" })
   return serviceEnvelope("site-1", extra.provider, { code: extra.code, nonce: extra.nonce });
 }
 
+test("failed Stripe reconnect handoff does not revoke the existing account", async (t) => {
+  await store.registerProviderOwnership(clientId, "site-1", "stripe", "acct_test");
+  t.mock.method(store, "putHandoff", async () => { throw new Error("database unavailable"); });
+  const now = Math.floor(Date.now() / 1000);
+  const state = sign({ typ: TOKEN_TYPES.clientState, v: 1, siteId: "site-1", provider: "stripe",
+    returnUrl: "https://client.example.com/api/payments/connect/stripe/callback", nonce: "reconnect", iat: now, exp: now + 600 }, clientSecret);
+  const start = await originalFetch(`${baseUrl}/connect/stripe/start?client_id=${clientId}&state=${encodeURIComponent(state)}`, { redirect: "manual" });
+  const brokerState = new URL(assertString(start.headers.get("location"))).searchParams.get("state")!;
+  const revokes = stripeRevokeCount;
+  const callback = await originalFetch(`${baseUrl}/connect/stripe/callback?code=new-code&state=${encodeURIComponent(brokerState)}`, {
+    redirect: "manual", headers: { cookie: cookieHeader(start) },
+  });
+  assert.equal(callback.status, 500);
+  assert.equal(stripeRevokeCount, revokes);
+  assert.ok(await store.isProviderOwnedBy(clientId, "site-1", "stripe", "acct_test"));
+});
+
 test("configuration rejects short or swapped credentials", () => {
   const validEnv: NodeJS.ProcessEnv = {
     DATABASE_URL: "postgres://unused",

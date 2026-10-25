@@ -22,6 +22,8 @@ Every token payload must include `typ`, `v`, `iat`, and an integer `exp`. Client
 
 Broker database payloads use AES-256-GCM. Browser-facing handoff codes contain no payload and are single-use. Durable Postgres records make state, code, and service-request replay protection work across replicas.
 
+Expired records are deleted in bounded batches every minute, including unredeemed sealed handoffs. The Postgres integration test uses an isolated temporary schema when `TEST_DATABASE_URL` is set; CI supplies a disposable Postgres service.
+
 ## Environment
 
 Copy `.env.example` to `.env` and fill in the values:

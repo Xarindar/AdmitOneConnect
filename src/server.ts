@@ -251,6 +251,7 @@ export function createApp(
       const stripeAccountId = provider === "stripe"
         ? (data as StripeHandoffData).stripeUserId
         : undefined;
+      const reconnect = stripeAccountId && await store.isProviderOwnedBy(state.clientId, handoff.siteId, "stripe", stripeAccountId);
       if (stripeAccountId) {
         await store.registerProviderOwnership(
           state.clientId,
@@ -273,7 +274,7 @@ export function createApp(
           expiresAt: handoff.exp,
         });
       } catch (error) {
-        if (stripeAccountId) {
+        if (stripeAccountId && !reconnect) {
           await store.removeProviderOwnership(
             state.clientId,
             handoff.siteId,
