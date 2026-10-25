@@ -1,4 +1,95 @@
-# Pivot payments to one-click OAuth connect via a standalone AdmitOne Connect broker
+# Current product requirements — 2026-10-25
+
+The client experience must be: Connect in Showrunner, sign in to the provider,
+approve, return connected. Clients must not copy API keys, webhook secrets, or
+developer application credentials. A location choice is reasonable when necessary.
+
+After setup, the client must not depend on Admit One Connect for payments, refunds,
+verification, token renewal, webhook delivery, or disconnect. Independence from our
+HTTP service and independence from our provider application's authority are separate
+requirements. The existing implementation achieves only part of this boundary.
+
+The historical plan below is superseded where it claims complete independence,
+long-lived Stripe tokens as the final design, or broker-based Square refresh.
+Current code uses durable opaque handoffs and direct Square PKCE refresh instead.
+
+## Stripe candidate requiring provider approval and verification
+
+Stripe's managed API keys preview allows an approved Stripe App with api_key_write
+to create merchant-specific keys. This is a different integration from our current
+ca_ Standard Connect OAuth configuration. Preview access and app review have not
+been verified for our account; no Stripe App manifest exists in this repository.
+
+Proposed implementation, contingent on the provider guarantees below:
+1. The client's Showrunner creates a per-attempt encryption key pair and keeps its
+   private key locally. Bind the public key to the authenticated site, nonce, mode,
+   callback origin and short-lived setup attempt.
+2. The seller installs/authorizes the provisioning Stripe App through Stripe.
+3. Connect requests a merchant-specific key with only Showrunner's required
+   permissions, encrypted by Stripe to the client's public key. Never send the
+   platform secret to Showrunner. Connect should relay ciphertext, not plaintext.
+4. Redeem a single-use opaque handoff. Showrunner decrypts and verifies the key's
+   merchant and mode, provisions the account webhook directly, and persists the
+   credential encrypted. Setup succeeds only after these steps succeed.
+5. Remove provisioning authority through a provider-supported mechanism that
+   preserves the merchant key. This step is NOT established by the documentation:
+   Stripe documents a merchant choice to retain keys during app uninstall, not a
+   verified automatic transfer of authority. Do not silently skip this requirement.
+6. Subsequent provider calls use only the client deployment's credentials. Remove
+   silent deployment-wide Stripe key fallback for a missing site credential.
+
+Do not replace the current flow with ordinary Stripe Apps OAuth: its hourly access
+token renewal requires the app developer's secret and recreates a central dependency.
+Do not ship preview-only API scaffolding as a working production connection.
+
+## Questions ready for Stripe preview review
+
+Use case: Admit One Connect installs payments into independently operated Showrunner
+deployments. Sellers must only sign in and approve. Each deployment must keep working
+without our service or continued provisioning authority after a successful handoff.
+
+- Can our app receive managed API keys preview access and api_key_write approval?
+- Can a scoped merchant key be encrypted to a different client-generated public key
+  for each install, with no plaintext key retained by the provisioning service?
+- Is there a supported automatic way to end provisioning authority while retaining
+  the issued key? Is merchant Dashboard uninstall/retain confirmation required?
+- What happens to retained keys if the provisioning app is unpublished, deleted,
+  suspended, or its developer account closes? What remains under developer control?
+- How does the merchant replace/rotate a retained key without our service and without
+  manual credential copying? Which operations can run solely in their Showrunner?
+- What exact permissions cover account verification, Checkout, refunds, account
+  webhooks and payment-method/domain configuration in this model?
+
+These questions have not been submitted. Do not represent preview access as approved.
+
+## Square boundary
+
+Keep seller authorization and direct PKCE renewal in Showrunner, with automatic
+payment/refund checks. These do not call Connect after setup. However the grant is
+still associated with our Square application ID. No documented automatic transfer
+to a seller-owned application has been established in this review. Request provider
+confirmation before promising independence from the application owner's lifecycle.
+Client-created applications/pasted personal tokens are not the accepted normal UX.
+
+## Acceptance proof using Cottage616
+
+In an isolated sandbox, finish seller-approved setup without pasted credentials;
+block all network access to Connect; remove its local config; restart Showrunner;
+verify checkout, delayed settlement, refund, webhook/reconciliation, credential
+renewal/replacement and disconnect. Separately prove removal of provisioning
+authority preserves the merchant credential. An HTTP health check, provider login
+page or mocked test alone does not establish this. Do not delete production apps,
+revoke live connections or create live charges to simulate failure.
+
+Sources checked 2026-10-25:
+- https://docs.stripe.com/stripe-apps/api-authentication/managed-api-keys
+- https://docs.stripe.com/keys/managed-api-keys
+- https://docs.stripe.com/stripe-apps/api-authentication/oauth
+- https://developer.squareup.com/reference/square/o-auth-api/obtain-token
+
+---
+
+# Historical plan: one-click OAuth connect via a standalone broker
 
 ## Context
 

@@ -2,6 +2,8 @@
 
 AdmitOne Connect is a small OAuth broker for Showrunner payment onboarding. It completes the one-time browser handshake and is never in the payment or token-refresh path. Stripe tokens are exchanged once and handed to Showrunner. Square uses end-to-end PKCE: Connect sees only the public challenge and short-lived authorization code, while Showrunner exchanges and refreshes its tokens directly with Square.
 
+This describes the deployed implementation, not complete client independence: Stripe OAuth disconnect still uses this broker, and both providers' grants remain associated with the registered provider application. The revised [requirements and provider approval questions](plan.txt) require automatic setup without copied keys and distinguish service availability from continued provider authority. Stripe managed-key provisioning is a candidate under review, not an implemented or approved capability.
+
 ## Flow
 
 1. Showrunner redirects the admin to `/connect/{provider}/start?client_id=...&state=...` on this broker.
@@ -21,6 +23,8 @@ base64url(JSON payload) + "." + base64url(HMAC_SHA256(encoded_payload, shared_se
 Every token payload must include `typ`, `v`, `iat`, and an integer `exp`. Client state tokens use `typ: "admitone.client_state"`.
 
 Broker database payloads use AES-256-GCM. Browser-facing handoff codes contain no payload and are single-use. Durable Postgres records make state, code, and service-request replay protection work across replicas.
+
+Expired records are deleted in bounded batches every minute, including unredeemed sealed handoffs. The Postgres integration test uses an isolated temporary schema when `TEST_DATABASE_URL` is set; CI supplies a disposable Postgres service.
 
 ## Environment
 
